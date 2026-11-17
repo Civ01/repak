@@ -28,8 +28,14 @@ impl Footer {
         let encrypted =
             version.version_major() >= VersionMajor::IndexEncryption && reader.read_bool()?;
         let magic = reader.read_u32::<LE>()?;
-        let version_major =
-            VersionMajor::from_repr(reader.read_u32::<LE>()?).unwrap_or(version.version_major());
+        if super::MAGIC != magic {
+            return Err(super::Error::Magic(magic));
+        }
+        let raw_version = reader.read_u32::<LE>()?;
+        // Unknown (newer) versions must not be parsed with an older layout:
+        // e.g. v13 changes the directory index without changing the footer.
+        let version_major = VersionMajor::from_repr(raw_version)
+            .ok_or(super::Error::UnsupportedVersion(raw_version))?;
         let index_offset = reader.read_u64::<LE>()?;
         let index_size = reader.read_u64::<LE>()?;
         let hash = Hash(reader.read_guid()?);
@@ -60,9 +66,6 @@ impl Footer {
             }
             compression
         };
-        if super::MAGIC != magic {
-            return Err(super::Error::Magic(magic));
-        }
         if version.version_major() != version_major {
             return Err(super::Error::Version {
                 used: version.version_major(),

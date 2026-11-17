@@ -37,6 +37,7 @@ pub enum Version {
     V9,
     V10,
     V11,
+    V12,
 }
 
 #[repr(u32)]
@@ -57,6 +58,7 @@ pub enum VersionMajor {
     FrozenIndex,           // v9 frozen index byte included
     PathHashIndex,         // v10
     Fnv64BugFix,           // v11
+    Utf8PakDirectory,      // v12 directory index strings may be UTF-8
 }
 
 // strum shouldn't need to be installed by users
@@ -107,6 +109,7 @@ impl Version {
             Version::V9 => VersionMajor::FrozenIndex,
             Version::V10 => VersionMajor::PathHashIndex,
             Version::V11 => VersionMajor::Fnv64BugFix,
+            Version::V12 => VersionMajor::Utf8PakDirectory,
         }
     }
 }

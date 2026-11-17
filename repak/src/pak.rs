@@ -183,13 +183,25 @@ impl PakReader {
         use std::fmt::Write;
         let mut log = "\n".to_owned();
 
+        // Errors that can only occur once the footer was recognised are more
+        // useful to callers than the generic "unsupported or encrypted".
+        let mut decisive: Option<super::Error> = None;
         for ver in Version::iter() {
             match Pak::read(&mut *reader, ver, &key) {
                 Ok(pak) => return Ok(Self { pak, key }),
-                Err(err) => writeln!(log, "trying version {} failed: {}", ver, err)?,
+                Err(err) => {
+                    writeln!(log, "trying version {} failed: {}", ver, err)?;
+                    match err {
+                        super::Error::Encrypted => decisive = Some(err),
+                        super::Error::UnsupportedVersion(_) if decisive.is_none() => {
+                            decisive = Some(err)
+                        }
+                        _ => {}
+                    }
+                }
             }
         }
-        Err(super::Error::UnsupportedOrEncrypted(log))
+        Err(decisive.unwrap_or(super::Error::UnsupportedOrEncrypted(log)))
     }
 
     fn new_inner<R: Read + Seek>(

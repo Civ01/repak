@@ -71,7 +71,7 @@ impl<R: std::io::Read> ReadExt for R {
         if len < 0 {
             let chars = self.read_array_len((-len) as usize, |r| Ok(r.read_u16::<LE>()?))?;
             let length = chars.iter().position(|&c| c == 0).unwrap_or(chars.len());
-            Ok(String::from_utf16(&chars[..length]).unwrap())
+            Ok(String::from_utf16_lossy(&chars[..length]))
         } else {
             let mut chars = vec![0; len as usize];
             self.read_exact(&mut chars)?;

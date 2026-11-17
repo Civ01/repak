@@ -410,5 +410,23 @@ mod roundtrip {
     }
 
     roundtrip_tests!(pre_fname: V5, V7);
-    roundtrip_tests!(fname: V8A, V8B, V9, V11);
+    roundtrip_tests!(fname: V8A, V8B, V9, V11, V12);
+}
+
+#[test]
+fn unknown_future_version_is_rejected_not_misparsed() {
+    // Write a v12 pak, then patch the footer version to 99.
+    let mut buf = std::io::Cursor::new(vec![]);
+    let mut w = repak::PakBuilder::new().writer(&mut buf, repak::Version::V12, "../../../".into(), None);
+    w.write_file("a.txt", false, b"hello").unwrap();
+    w.write_index().unwrap();
+    let mut bytes = buf.into_inner();
+    let magic = 0x5A6F12E1u32.to_le_bytes();
+    let pos = bytes.windows(4).rposition(|w| w == magic).unwrap();
+    assert_eq!(&bytes[pos + 4..pos + 8], &12u32.to_le_bytes());
+    bytes[pos + 4..pos + 8].copy_from_slice(&99u32.to_le_bytes());
+    let err = repak::PakBuilder::new()
+        .reader(&mut std::io::Cursor::new(bytes))
+        .unwrap_err();
+    assert!(matches!(err, repak::Error::UnsupportedVersion(99)), "{err}");
 }

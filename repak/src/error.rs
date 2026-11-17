@@ -73,6 +73,9 @@ pub enum Error {
     #[error("pak is encrypted but no key was provided")]
     Encrypted,
 
+    #[error("pak version {0} is not supported")]
+    UnsupportedVersion(u32),
+
     #[error("error with OsString")]
     OsString(std::ffi::OsString),
 
