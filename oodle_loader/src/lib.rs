@@ -262,16 +262,7 @@ where
 }
 
 fn locate_oodle() -> Result<PathBuf> {
-    let mut searched = SEARCH_PATHS
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .clone();
-    if let Some(exe_dir) = std::env::current_exe()
-        .ok()
-        .and_then(|p| p.parent().map(Path::to_path_buf))
-    {
-        searched.push(exe_dir);
-    }
+    let searched = search_paths();
     for path in &searched {
         if path.is_file() {
             return Ok(path.clone());
@@ -292,12 +283,18 @@ fn locate_oodle() -> Result<PathBuf> {
 
 pub struct Oodle {
     _library: libloading::Library,
+    path: PathBuf,
     compress: oodle_lz::Compress,
     decompress: oodle_lz::Decompress,
     get_compressed_buffer_size_needed: oodle_lz::GetCompressedBufferSizeNeeded,
 }
 impl Oodle {
-    fn new(lib: libloading::Library) -> Result<Self> {
+    /// Path of the loaded library file.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    fn new(lib: libloading::Library, path: PathBuf) -> Result<Self> {
         unsafe {
             let res = Oodle {
                 compress: *lib.get(b"OodleLZ_Compress")?,
@@ -305,6 +302,7 @@ impl Oodle {
                 get_compressed_buffer_size_needed: *lib
                     .get(b"OodleLZ_GetCompressedBufferSizeNeeded")?,
                 _library: lib,
+                path,
             };
             // silence oodle logging; not exported by every oo2core version
             if let Ok(set_printf) = res
@@ -382,8 +380,8 @@ static INIT_LOCK: Mutex<()> = Mutex::new(());
 fn load_oodle() -> Result<Oodle> {
     let path = locate_oodle()?;
     unsafe {
-        let library = libloading::Library::new(path)?;
-        Oodle::new(library)
+        let library = libloading::Library::new(&path)?;
+        Oodle::new(library, path)
     }
 }
 
@@ -400,6 +398,21 @@ pub fn oodle() -> Result<&'static Oodle> {
     }
     let oodle = load_oodle()?;
     Ok(OODLE.get_or_init(|| oodle))
+}
+
+/// The locations that would be searched right now, in order (for diagnostics).
+pub fn search_paths() -> Vec<PathBuf> {
+    let mut paths = SEARCH_PATHS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    if let Some(exe_dir) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+    {
+        paths.push(exe_dir);
+    }
+    paths
 }
 
 /// True if Oodle is already loaded; never triggers a load.
