@@ -115,6 +115,10 @@ fn test_read(version: repak::Version, _file_name: &str, bytes: &[u8]) {
     let files: HashSet<String> = HashSet::from_iter(pak.files());
     assert_eq!(
         files,
+        pak.entries().map(|(p, _)| p.to_string()).collect::<HashSet<_>>()
+    );
+    assert_eq!(
+        files,
         HashSet::from_iter(
             vec!["test.txt", "test.png", "zeros.bin", "directory/nested.txt"]
                 .into_iter()
@@ -126,6 +130,8 @@ fn test_read(version: repak::Version, _file_name: &str, bytes: &[u8]) {
         let mut buf = vec![];
         let mut writer = std::io::Cursor::new(&mut buf);
         pak.read_file(&file, &mut reader, &mut writer).unwrap();
+        let info = pak.entry(&file).expect("entry metadata");
+        assert_eq!(info.uncompressed_size, buf.len() as u64, "{file} uncompressed size");
         match file.as_str() {
             "test.txt" => assert_eq!(
                 buf,

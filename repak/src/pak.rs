@@ -73,6 +73,21 @@ impl PakBuilder {
     }
 }
 
+/// Per-entry metadata exposed by [`PakReader::entries`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EntryInfo {
+    /// Offset of the entry record in the pak file.
+    pub offset: u64,
+    /// Size of the stored (compressed) data, excluding the entry record.
+    pub compressed_size: u64,
+    pub uncompressed_size: u64,
+    /// `None` when the entry is stored uncompressed.
+    pub compression: Option<Compression>,
+    pub encrypted: bool,
+    /// Raw timestamp, only present in very old pak versions.
+    pub timestamp: Option<u64>,
+}
+
 #[derive(Debug)]
 pub struct PakReader {
     pak: Pak,
@@ -231,6 +246,37 @@ impl PakReader {
 
     pub fn files(&self) -> Vec<String> {
         self.pak.index.entries().keys().cloned().collect()
+    }
+
+    /// Metadata for every entry, in index order, without reading file data.
+    pub fn entries(&self) -> impl Iterator<Item = (&str, EntryInfo)> + '_ {
+        self.pak
+            .index
+            .entries()
+            .iter()
+            .map(|(path, entry)| (path.as_str(), self.entry_info(entry)))
+    }
+
+    /// Metadata for a single entry, without reading file data.
+    pub fn entry(&self, path: &str) -> Option<EntryInfo> {
+        self.pak
+            .index
+            .entries()
+            .get(path)
+            .map(|entry| self.entry_info(entry))
+    }
+
+    fn entry_info(&self, entry: &super::entry::Entry) -> EntryInfo {
+        EntryInfo {
+            offset: entry.offset,
+            compressed_size: entry.compressed,
+            uncompressed_size: entry.uncompressed,
+            compression: entry
+                .compression_slot
+                .and_then(|slot| self.pak.compression.get(slot as usize).copied().flatten()),
+            encrypted: entry.is_encrypted(),
+            timestamp: entry.timestamp,
+        }
     }
 
     pub fn used_compression(&self) -> Vec<Compression> {
