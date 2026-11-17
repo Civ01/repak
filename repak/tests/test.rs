@@ -495,3 +495,93 @@ fn block_size_and_uncompressible_fallback() {
     assert_eq!(pak.get("c.bin", &mut r).unwrap(), compressible);
     assert_eq!(pak.get("r.bin", &mut r).unwrap(), random);
 }
+
+#[test]
+fn modify_existing_pak_in_place() {
+    use std::io::{Seek, Write};
+    // original: zlib, two files
+    let mut buf = std::io::Cursor::new(vec![]);
+    let mut w = repak::PakBuilder::new()
+        .compression([repak::Compression::Zlib])
+        .writer(&mut buf, repak::Version::V11, "../../../Game/Content/".into(), Some(7));
+    w.write_file("a.txt", true, b"aaaa".repeat(1000)).unwrap();
+    w.write_file("dir/b.txt", true, b"bbbb".repeat(1000)).unwrap();
+    w.write_index().unwrap();
+    let original = buf.into_inner();
+
+    // reopen: remove a, replace b, add c with another method, re-root, new mount
+    let mut file = std::io::Cursor::new(original.clone());
+    let pak = repak::PakBuilder::new().reader(&mut file).unwrap();
+    let index_offset = pak.index_offset().unwrap();
+    let mut w = pak.into_pakwriter(&mut file).unwrap();
+    assert!(w.remove("a.txt"));
+    assert!(!w.remove("missing"));
+    w.set_compression([repak::Compression::Gzip]);
+    w.set_compression_options(repak::CompressionOptions { gzip_level: 9, ..Default::default() });
+    w.write_file("dir/b.txt", true, b"BBBB".repeat(1000)).unwrap();
+    w.write_file("c.txt", true, b"cccc".repeat(1000)).unwrap();
+    w.rename_all(|p| format!("Content/{p}")).unwrap();
+    w.set_mount_point("../../../Game/".into());
+    assert_eq!(w.paths(), ["Content/c.txt", "Content/dir/b.txt"]);
+    let out = w.write_index().unwrap();
+    let end = out.stream_position().unwrap();
+    out.get_mut().truncate(end as usize);
+    out.flush().unwrap();
+    let bytes = file.into_inner();
+    assert!(bytes[..index_offset as usize] == original[..index_offset as usize], "old data untouched");
+
+    let mut r = std::io::Cursor::new(&bytes);
+    let pak = repak::PakBuilder::new().reader(&mut r).unwrap();
+    assert_eq!(pak.mount_point(), "../../../Game/");
+    assert_eq!(pak.path_hash_seed(), Some(7), "seed kept");
+    assert_eq!(pak.files(), ["Content/c.txt", "Content/dir/b.txt"]);
+    assert_eq!(pak.get("Content/dir/b.txt", &mut r).unwrap(), b"BBBB".repeat(1000));
+    assert_eq!(pak.get("Content/c.txt", &mut r).unwrap(), b"cccc".repeat(1000));
+    let methods = pak.used_compression();
+    assert!(methods.contains(&repak::Compression::Gzip));
+
+    // delete-only rewrite: new index is smaller -> must truncate to stay valid
+    let mut file = std::io::Cursor::new(bytes.clone());
+    let pak = repak::PakBuilder::new().reader(&mut file).unwrap();
+    let mut w = pak.into_pakwriter(&mut file).unwrap();
+    w.remove("Content/c.txt");
+    let out = w.write_index().unwrap();
+    let end = out.stream_position().unwrap();
+    out.get_mut().truncate(end as usize);
+    let bytes2 = file.into_inner();
+    assert!(bytes2.len() < bytes.len());
+    let mut r = std::io::Cursor::new(&bytes2);
+    let pak = repak::PakBuilder::new().reader(&mut r).unwrap();
+    assert_eq!(pak.files(), ["Content/dir/b.txt"]);
+
+    // rename collision is refused without changes
+    let mut file = std::io::Cursor::new(bytes);
+    let pak = repak::PakBuilder::new().reader(&mut file).unwrap();
+    let mut w = pak.into_pakwriter(&mut file).unwrap();
+    assert!(w.rename_all(|_| "same".into()).is_err());
+    assert_eq!(w.paths().len(), 2);
+}
+
+#[test]
+fn compression_levels_change_output() {
+    let data = b"The quick brown fox jumps over the lazy dog. ".repeat(4000);
+    let size = |opts: repak::CompressionOptions, c: repak::Compression| {
+        let mut buf = std::io::Cursor::new(vec![]);
+        let mut w = repak::PakBuilder::new()
+            .compression([c])
+            .compression_options(opts)
+            .writer(&mut buf, repak::Version::V11, "../../../".into(), None);
+        w.write_file("x", true, &data).unwrap();
+        w.write_index().unwrap();
+        let bytes = buf.into_inner();
+        let mut r = std::io::Cursor::new(&bytes);
+        let pak = repak::PakBuilder::new().reader(&mut r).unwrap();
+        assert_eq!(pak.get("x", &mut r).unwrap(), data);
+        pak.entry("x").unwrap().compressed_size
+    };
+    let d = repak::CompressionOptions::default();
+    assert!(size(repak::CompressionOptions { zlib_level: 9, ..d }, repak::Compression::Zlib)
+        <= size(d, repak::Compression::Zlib));
+    assert!(size(repak::CompressionOptions { zstd_level: 19, ..d }, repak::Compression::Zstd)
+        <= size(repak::CompressionOptions { zstd_level: 1, ..d }, repak::Compression::Zstd));
+}

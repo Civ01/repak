@@ -7,7 +7,7 @@ mod footer;
 mod pak;
 
 pub use {
-    data::{PartialEntry, DEFAULT_COMPRESSION_BLOCK_SIZE},
+    data::{CompressionOptions, OodleCompressor, PartialEntry, DEFAULT_COMPRESSION_BLOCK_SIZE},
     error::*,
     pak::*,
 };

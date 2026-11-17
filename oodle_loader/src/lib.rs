@@ -5,6 +5,30 @@ type Result<T, E = Error> = std::result::Result<T, E>;
 
 pub use oodle_lz::{CompressionLevel, Compressor};
 
+impl CompressionLevel {
+    /// Oodle's numeric level (-4 = HyperFast4 … 9 = Optimal5).
+    pub fn from_i32(v: i32) -> Option<Self> {
+        use CompressionLevel::*;
+        Some(match v {
+            -4 => HyperFast4,
+            -3 => HyperFast3,
+            -2 => HyperFast2,
+            -1 => HyperFast1,
+            0 => None,
+            1 => SuperFast,
+            2 => VeryFast,
+            3 => Fast,
+            4 => Normal,
+            5 => Optimal1,
+            6 => Optimal2,
+            7 => Optimal3,
+            8 => Optimal4,
+            9 => Optimal5,
+            _ => return Option::None,
+        })
+    }
+}
+
 mod oodle_lz {
     #[derive(Debug, Clone, Copy)]
     #[repr(i32)]

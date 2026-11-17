@@ -21,6 +21,7 @@ pub struct PakBuilder {
     key: super::Key,
     allowed_compression: Vec<Compression>,
     compression_block_size: u32,
+    compression_options: crate::CompressionOptions,
 }
 
 impl Default for PakBuilder {
@@ -35,6 +36,7 @@ impl PakBuilder {
             key: Default::default(),
             allowed_compression: Default::default(),
             compression_block_size: crate::data::DEFAULT_COMPRESSION_BLOCK_SIZE,
+            compression_options: Default::default(),
         }
     }
     #[cfg(feature = "encryption")]
@@ -52,6 +54,11 @@ impl PakBuilder {
     /// (126,976 bytes); UnrealPak uses 65,536.
     pub fn compression_block_size(mut self, size: u32) -> Self {
         self.compression_block_size = size;
+        self
+    }
+    /// Levels / Oodle compressor used when writing.
+    pub fn compression_options(mut self, options: crate::CompressionOptions) -> Self {
+        self.compression_options = options;
         self
     }
     pub fn reader<R: Read + Seek>(self, reader: &mut R) -> Result<PakReader, super::Error> {
@@ -79,6 +86,7 @@ impl PakBuilder {
             path_hash_seed,
             self.allowed_compression,
             self.compression_block_size,
+            self.compression_options,
         )
     }
 }
@@ -111,6 +119,7 @@ pub struct PakWriter<W: Write + Seek> {
     key: super::Key,
     allowed_compression: Vec<Compression>,
     compression_block_size: u32,
+    compression_options: crate::CompressionOptions,
 }
 
 #[derive(Debug)]
@@ -236,6 +245,12 @@ impl PakReader {
         &self.pak.mount_point
     }
 
+    /// Offset of the index in the file (where appended data starts when the
+    /// pak is reopened for writing with [`PakReader::into_pakwriter`]).
+    pub fn index_offset(&self) -> Option<u64> {
+        self.pak.index_offset
+    }
+
     pub fn encrypted_index(&self) -> bool {
         self.pak.encrypted_index
     }
@@ -332,6 +347,7 @@ impl PakReader {
         Ok(PakWriter {
             allowed_compression: self.pak.compression.iter().filter_map(|c| *c).collect(),
             compression_block_size: crate::data::DEFAULT_COMPRESSION_BLOCK_SIZE,
+            compression_options: Default::default(),
             pak: self.pak,
             key: self.key,
             writer,
@@ -340,6 +356,56 @@ impl PakReader {
 }
 
 impl<W: Write + Seek> PakWriter<W> {
+    /// Compression methods for entries written from now on (first one is used).
+    pub fn set_compression(&mut self, compression: impl IntoIterator<Item = Compression>) {
+        self.allowed_compression = compression.into_iter().collect();
+    }
+
+    pub fn set_compression_block_size(&mut self, size: u32) {
+        self.compression_block_size = size;
+    }
+
+    pub fn set_compression_options(&mut self, options: crate::CompressionOptions) {
+        self.compression_options = options;
+    }
+
+    pub fn version(&self) -> super::Version {
+        self.pak.version
+    }
+
+    pub fn mount_point(&self) -> &str {
+        &self.pak.mount_point
+    }
+
+    pub fn set_mount_point(&mut self, mount_point: String) {
+        self.pak.mount_point = mount_point;
+    }
+
+    /// Entry paths currently in the index.
+    pub fn paths(&self) -> Vec<String> {
+        self.pak.index.entries.keys().cloned().collect()
+    }
+
+    /// Removes an entry from the index (its data stays in the file as dead
+    /// space). Returns whether it existed.
+    pub fn remove(&mut self, path: &str) -> bool {
+        self.pak.index.entries.remove(path).is_some()
+    }
+
+    /// Renames every entry with `f`. Fails without changing anything if two
+    /// entries would end up with the same path.
+    pub fn rename_all(&mut self, f: impl Fn(&str) -> String) -> Result<(), super::Error> {
+        let mut renamed = BTreeMap::new();
+        for (path, entry) in &self.pak.index.entries {
+            let new = f(path);
+            if renamed.insert(new.clone(), entry.clone()).is_some() {
+                return Err(super::Error::Other(format!("rename collision: {new}")));
+            }
+        }
+        self.pak.index.entries = renamed;
+        Ok(())
+    }
+
     fn new_inner(
         writer: W,
         key: super::Key,
@@ -348,6 +414,7 @@ impl<W: Write + Seek> PakWriter<W> {
         path_hash_seed: Option<u64>,
         allowed_compression: Vec<Compression>,
         compression_block_size: u32,
+        compression_options: crate::CompressionOptions,
     ) -> Self {
         PakWriter {
             pak: Pak::new(version, mount_point, path_hash_seed),
@@ -355,6 +422,7 @@ impl<W: Write + Seek> PakWriter<W> {
             key,
             allowed_compression,
             compression_block_size,
+            compression_options,
         }
     }
 
@@ -380,6 +448,7 @@ impl<W: Write + Seek> PakWriter<W> {
                     &[]
                 },
                 self.compression_block_size,
+                &self.compression_options,
                 data.as_ref(),
             )?,
         );
@@ -391,6 +460,7 @@ impl<W: Write + Seek> PakWriter<W> {
         EntryBuilder {
             allowed_compression: self.allowed_compression.clone(),
             compression_block_size: self.compression_block_size,
+            compression_options: self.compression_options,
         }
     }
 
@@ -435,6 +505,7 @@ impl AsRef<[u8]> for Data<'_> {
 pub struct EntryBuilder {
     allowed_compression: Vec<Compression>,
     compression_block_size: u32,
+    compression_options: crate::CompressionOptions,
 }
 impl EntryBuilder {
     /// Builds an entry in memory (compressed if requested) which must be written out later
@@ -448,7 +519,12 @@ impl EntryBuilder {
         } else {
             &[]
         };
-        build_partial_entry(compression, self.compression_block_size, data)
+        build_partial_entry(
+            compression,
+            self.compression_block_size,
+            &self.compression_options,
+            data,
+        )
     }
 }
 

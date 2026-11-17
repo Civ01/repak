@@ -134,6 +134,45 @@ impl<D: AsRef<[u8]>> PartialEntry<D> {
     }
 }
 
+/// Oodle compressor family used when writing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OodleCompressor {
+    Kraken,
+    #[default]
+    Mermaid,
+    Selkie,
+    Leviathan,
+    Hydra,
+}
+
+/// Per-method compression settings for writing. Defaults reproduce repak's
+/// historical output (zlib/gzip level 1, zstd default level, Oodle Mermaid
+/// at Normal).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CompressionOptions {
+    /// 0–9
+    pub zlib_level: u32,
+    /// 0–9
+    pub gzip_level: u32,
+    /// 1–22; 0 = zstd's default (3)
+    pub zstd_level: i32,
+    pub oodle_compressor: OodleCompressor,
+    /// -4 (HyperFast4) … 9 (Optimal5); 4 = Normal
+    pub oodle_level: i32,
+}
+
+impl Default for CompressionOptions {
+    fn default() -> Self {
+        CompressionOptions {
+            zlib_level: 1,
+            gzip_level: 1,
+            zstd_level: 0,
+            oodle_compressor: OodleCompressor::Mermaid,
+            oodle_level: 4,
+        }
+    }
+}
+
 /// repak's historical default: the largest block size that fits the compact
 /// encoding in the entry flags (readable by every engine version).
 pub const DEFAULT_COMPRESSION_BLOCK_SIZE: u32 = 0x3e << 11;
@@ -141,6 +180,7 @@ pub const DEFAULT_COMPRESSION_BLOCK_SIZE: u32 = 0x3e << 11;
 pub(crate) fn build_partial_entry<D>(
     allowed_compression: &[Compression],
     compression_block_size: u32,
+    options: &CompressionOptions,
     data: D,
 ) -> Result<PartialEntry<D>>
 where
@@ -166,7 +206,7 @@ where
         let mut compressed_size = 0;
         let mut blocks = vec![];
         for chunk in data.as_ref().chunks(block_size as usize) {
-            let data = compress(compression, chunk)?;
+            let data = compress(compression, options, chunk)?;
             compressed_size += data.len() as u64;
             blocks.push(PartialBlock {
                 uncompressed_size: chunk.len(),
@@ -190,7 +230,7 @@ where
         }
     }
     #[cfg(not(feature = "compression"))]
-    let _ = (compression, compression_block_size);
+    let _ = (compression, compression_block_size, options);
 
     Ok(PartialEntry {
         compression: None,
@@ -203,34 +243,43 @@ where
 }
 
 #[cfg(feature = "compression")]
-fn compress(compression: Compression, data: &[u8]) -> Result<Vec<u8>> {
+fn compress(compression: Compression, options: &CompressionOptions, data: &[u8]) -> Result<Vec<u8>> {
     use std::io::Write;
 
     let compressed = match compression {
         Compression::Zlib => {
-            let mut compress =
-                flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::fast());
+            let mut compress = flate2::write::ZlibEncoder::new(
+                Vec::new(),
+                flate2::Compression::new(options.zlib_level.min(9)),
+            );
             compress.write_all(data.as_ref())?;
             compress.finish()?
         }
         Compression::Gzip => {
-            let mut compress =
-                flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
+            let mut compress = flate2::write::GzEncoder::new(
+                Vec::new(),
+                flate2::Compression::new(options.gzip_level.min(9)),
+            );
             compress.write_all(data.as_ref())?;
             compress.finish()?
         }
-        Compression::Zstd => zstd::stream::encode_all(data, 0)?,
+        Compression::Zstd => zstd::stream::encode_all(data, options.zstd_level.clamp(0, 22))?,
         Compression::LZ4 => lz4_flex::block::compress(data),
         Compression::Oodle => {
             #[cfg(not(feature = "oodle_core"))]
             return Err(super::Error::Oodle);
             #[cfg(feature = "oodle_core")]
             {
-                oodle_loader::oodle()?.compress(
-                    data.as_ref(),
-                    oodle_loader::Compressor::Mermaid,
-                    oodle_loader::CompressionLevel::Normal,
-                )?
+                let compressor = match options.oodle_compressor {
+                    OodleCompressor::Kraken => oodle_loader::Compressor::Kraken,
+                    OodleCompressor::Mermaid => oodle_loader::Compressor::Mermaid,
+                    OodleCompressor::Selkie => oodle_loader::Compressor::Selkie,
+                    OodleCompressor::Leviathan => oodle_loader::Compressor::Leviathan,
+                    OodleCompressor::Hydra => oodle_loader::Compressor::Hydra,
+                };
+                let level = oodle_loader::CompressionLevel::from_i32(options.oodle_level)
+                    .unwrap_or(oodle_loader::CompressionLevel::Normal);
+                oodle_loader::oodle()?.compress(data.as_ref(), compressor, level)?
             }
         }
     };
