@@ -216,11 +216,11 @@ fn compress(compression: Compression, data: &[u8]) -> Result<Vec<u8>> {
         Compression::Zstd => zstd::stream::encode_all(data, 0)?,
         Compression::LZ4 => lz4_flex::block::compress(data),
         Compression::Oodle => {
-            #[cfg(not(feature = "oodle"))]
+            #[cfg(not(feature = "oodle_core"))]
             return Err(super::Error::Oodle);
-            #[cfg(feature = "oodle")]
+            #[cfg(feature = "oodle_core")]
             {
-                oodle_loader::oodle().unwrap().compress(
+                oodle_loader::oodle()?.compress(
                     data.as_ref(),
                     oodle_loader::Compressor::Mermaid,
                     oodle_loader::CompressionLevel::Normal,

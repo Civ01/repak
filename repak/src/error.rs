@@ -42,7 +42,7 @@ pub enum Error {
     #[error("found magic of {:#x} instead of {:#x}", .0, super::MAGIC)]
     Magic(u32),
 
-    #[cfg(feature = "oodle")]
+    #[cfg(feature = "oodle_core")]
     #[error("Oodle loader error: {0}")]
     OodleFailed(#[from] oodle_loader::Error),
 

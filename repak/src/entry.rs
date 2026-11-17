@@ -343,7 +343,7 @@ impl Entry {
     ) -> Result<(), super::Error> {
         reader.seek(io::SeekFrom::Start(self.offset))?;
         Entry::read(reader, version)?;
-        #[cfg(any(feature = "compression", feature = "oodle"))]
+        #[cfg(any(feature = "compression", feature = "oodle_core"))]
         let data_offset = reader.stream_position()?;
         #[allow(unused_mut)]
         let mut data = reader.read_len(match self.is_encrypted() {
@@ -424,7 +424,7 @@ impl Entry {
                         }
                         buf.write_all(&decompressed)?;
                     }
-                    #[cfg(feature = "oodle")]
+                    #[cfg(feature = "oodle_core")]
                     Compression::Oodle => {
                         let mut decompressed = vec![0; self.uncompressed as usize];
                         for (decomp_chunk, comp_range) in
@@ -438,7 +438,7 @@ impl Entry {
                         }
                         buf.write_all(&decompressed)?;
                     }
-                    #[cfg(not(feature = "oodle"))]
+                    #[cfg(not(feature = "oodle_core"))]
                     Compression::Oodle => return Err(super::Error::Oodle),
                 }
             }

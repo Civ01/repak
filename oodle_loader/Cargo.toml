@@ -6,9 +6,14 @@ license.workspace = true
 version.workspace = true
 edition.workspace = true
 
+[features]
+default = ["download"]
+# Fetch a known-good Oodle build from GitHub when none is found locally.
+download = ["dep:ureq", "dep:sha2", "dep:hex"]
+
 [dependencies]
 libloading = "0.9"
-ureq = "3.1"
-hex = { workspace = true }
-sha2 = "0.10.9"
+ureq = { version = "3.1", optional = true }
+hex = { workspace = true, optional = true }
+sha2 = { version = "0.10.9", optional = true }
 thiserror = "2.0.17"

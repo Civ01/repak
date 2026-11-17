@@ -1,4 +1,5 @@
-use std::sync::OnceLock;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex, OnceLock};
 
 type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -97,9 +98,12 @@ mod oodle_lz {
     pub type SetPrintf = unsafe extern "system" fn(printf: *const ());
 }
 
+#[cfg(feature = "download")]
 static OODLE_VERSION: &str = "2.9.10";
+#[cfg(feature = "download")]
 static OODLE_BASE_URL: &str = "https://github.com/WorkingRobot/OodleUE/raw/refs/heads/main/Engine/Source/Programs/Shared/EpicGames.Oodle/Sdk/";
 
+#[allow(dead_code)]
 struct OodlePlatform {
     path: &'static str,
     name: &'static str,
@@ -141,6 +145,7 @@ static OODLE_PLATFORM: OodlePlatform = OodlePlatform {
     hash: "6f5d41a7892ea6b2db420f2458dad2f84a63901c9a93ce9497337b16c195f457",
 };
 
+#[cfg(feature = "download")]
 fn url() -> String {
     format!(
         "{OODLE_BASE_URL}/{}/{}/{}",
@@ -154,21 +159,32 @@ pub enum Error {
     HashMismatch { expected: String, found: String },
     #[error("Oodle compression failed")]
     CompressionFailed,
-    #[error("Oodle initialization failed previously")]
-    InitializationFailed,
+    #[error("Oodle library not found (searched: {})", display_paths(.searched))]
+    NotFound { searched: Vec<PathBuf> },
     #[error("IO error {0:?}")]
     Io(#[from] std::io::Error),
+    #[cfg(feature = "download")]
     #[error("ureq error {0:?}")]
     Ureq(Box<ureq::Error>),
     #[error("Oodle libloading error {0:?}")]
     LibLoading(#[from] libloading::Error),
 }
+#[cfg(feature = "download")]
 impl From<ureq::Error> for Error {
     fn from(value: ureq::Error) -> Self {
         Self::Ureq(value.into())
     }
 }
 
+fn display_paths(paths: &[PathBuf]) -> String {
+    paths
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+#[cfg(feature = "download")]
 fn check_hash(buffer: &[u8]) -> Result<()> {
     use sha2::{Digest, Sha256};
 
@@ -185,16 +201,93 @@ fn check_hash(buffer: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn fetch_oodle() -> Result<std::path::PathBuf> {
+/// Downloads the known-good Oodle build next to the current executable.
+/// Only the downloaded bytes are hash-checked; user-supplied files are not.
+#[cfg(feature = "download")]
+fn download_oodle() -> Result<PathBuf> {
     let oodle_path = std::env::current_exe()?.with_file_name(OODLE_PLATFORM.name);
-    if !oodle_path.exists() {
-        let buffer = ureq::get(&url()).call()?.into_body().read_to_vec()?;
-        check_hash(&buffer)?;
-        std::fs::write(&oodle_path, buffer)?;
-    }
-    // don't check existing file to allow user to substitute other versions
-    // check_hash(&std::fs::read(&oodle_path)?)?;
+    let buffer = ureq::get(&url()).call()?.into_body().read_to_vec()?;
+    check_hash(&buffer)?;
+    std::fs::write(&oodle_path, buffer)?;
     Ok(oodle_path)
+}
+
+/// Extracts N from `oo2core_N_win64.dll` (case-insensitive). Windows naming only.
+fn windows_core_version(file_name: &str) -> Option<u32> {
+    let lower = file_name.to_ascii_lowercase();
+    let rest = lower.strip_prefix("oo2core_")?;
+    let rest = rest.strip_suffix("_win64.dll")?;
+    rest.parse().ok()
+}
+
+/// Finds the best Oodle core library inside `dir`.
+/// On Windows any `oo2core_N_win64.dll` is accepted and the highest N wins;
+/// elsewhere the platform's canonical file name is used.
+fn find_in_dir(dir: &Path) -> Option<PathBuf> {
+    let mut best: Option<(u32, PathBuf)> = None;
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let Some(name) = name.to_str() else { continue };
+            let version = if cfg!(windows) {
+                windows_core_version(name)
+            } else if name == OODLE_PLATFORM.name {
+                Some(0)
+            } else {
+                None
+            };
+            if let Some(v) = version {
+                if best.as_ref().is_none_or(|(bv, _)| v > *bv) {
+                    best = Some((v, entry.path()));
+                }
+            }
+        }
+    }
+    best.map(|(_, p)| p)
+}
+
+static SEARCH_PATHS: Mutex<Vec<PathBuf>> = Mutex::new(Vec::new());
+
+/// Sets the locations searched for the Oodle core library, in priority order.
+/// Each entry may be a directory (scanned for `oo2core_*_win64.dll`) or a file path.
+/// When set, these are searched before the executable's directory.
+/// Has no effect once Oodle has been loaded successfully.
+pub fn set_search_paths<I, P>(paths: I)
+where
+    I: IntoIterator<Item = P>,
+    P: Into<PathBuf>,
+{
+    let mut guard = SEARCH_PATHS.lock().unwrap_or_else(|e| e.into_inner());
+    *guard = paths.into_iter().map(Into::into).collect();
+}
+
+fn locate_oodle() -> Result<PathBuf> {
+    let mut searched = SEARCH_PATHS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    if let Some(exe_dir) = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(Path::to_path_buf))
+    {
+        searched.push(exe_dir);
+    }
+    for path in &searched {
+        if path.is_file() {
+            return Ok(path.clone());
+        }
+        if let Some(found) = find_in_dir(path) {
+            return Ok(found);
+        }
+    }
+    #[cfg(feature = "download")]
+    {
+        download_oodle()
+    }
+    #[cfg(not(feature = "download"))]
+    {
+        Err(Error::NotFound { searched })
+    }
 }
 
 pub struct Oodle {
@@ -202,7 +295,6 @@ pub struct Oodle {
     compress: oodle_lz::Compress,
     decompress: oodle_lz::Decompress,
     get_compressed_buffer_size_needed: oodle_lz::GetCompressedBufferSizeNeeded,
-    set_printf: oodle_lz::SetPrintf,
 }
 impl Oodle {
     fn new(lib: libloading::Library) -> Result<Self> {
@@ -212,10 +304,15 @@ impl Oodle {
                 decompress: *lib.get(b"OodleLZ_Decompress")?,
                 get_compressed_buffer_size_needed: *lib
                     .get(b"OodleLZ_GetCompressedBufferSizeNeeded")?,
-                set_printf: *lib.get(b"OodleCore_Plugins_SetPrintf")?,
                 _library: lib,
             };
-            (res.set_printf)(std::ptr::null()); // silence oodle logging
+            // silence oodle logging; not exported by every oo2core version
+            if let Ok(set_printf) = res
+                ._library
+                .get::<oodle_lz::SetPrintf>(b"OodleCore_Plugins_SetPrintf")
+            {
+                (set_printf)(std::ptr::null());
+            }
             Ok(res)
         }
     }
@@ -279,33 +376,35 @@ impl Oodle {
     }
 }
 
-static OODLE: OnceLock<Option<Oodle>> = OnceLock::new();
+static OODLE: OnceLock<Oodle> = OnceLock::new();
+static INIT_LOCK: Mutex<()> = Mutex::new(());
 
 fn load_oodle() -> Result<Oodle> {
-    let path = fetch_oodle()?;
+    let path = locate_oodle()?;
     unsafe {
         let library = libloading::Library::new(path)?;
         Oodle::new(library)
     }
 }
 
+/// Returns the loaded Oodle library, loading it on first successful call.
+/// Failures are not cached: a later call retries, so a library added after
+/// a failed attempt is picked up without restarting the host process.
 pub fn oodle() -> Result<&'static Oodle> {
-    let mut result = None;
-    let oodle = OODLE.get_or_init(|| match load_oodle() {
-        Err(err) => {
-            result = Some(Err(err));
-            None
-        }
-        Ok(oodle) => Some(oodle),
-    });
-    match (result, oodle) {
-        // oodle initialized so return
-        (_, Some(oodle)) => Ok(oodle),
-        // error during initialization
-        (Some(result), _) => result?,
-        // no error because initialization was tried and failed before
-        _ => Err(Error::InitializationFailed),
+    if let Some(oodle) = OODLE.get() {
+        return Ok(oodle);
     }
+    let _guard = INIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(oodle) = OODLE.get() {
+        return Ok(oodle);
+    }
+    let oodle = load_oodle()?;
+    Ok(OODLE.get_or_init(|| oodle))
+}
+
+/// True if Oodle is already loaded; never triggers a load.
+pub fn is_loaded() -> bool {
+    OODLE.get().is_some()
 }
 
 #[cfg(test)]
@@ -313,6 +412,15 @@ mod test {
     use super::*;
 
     #[test]
+    fn parses_windows_core_names() {
+        assert_eq!(windows_core_version("oo2core_9_win64.dll"), Some(9));
+        assert_eq!(windows_core_version("OO2CORE_5_WIN64.DLL"), Some(5));
+        assert_eq!(windows_core_version("oo2core_9_win32.dll"), None);
+        assert_eq!(windows_core_version("oo2net_9_win64.dll"), None);
+    }
+
+    #[test]
+    #[cfg_attr(not(feature = "download"), ignore = "needs the Oodle library")]
     fn test_oodle() {
         let oodle = oodle().unwrap();
 
