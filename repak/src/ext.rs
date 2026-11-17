@@ -59,8 +59,9 @@ impl<R: std::io::Read> ReadExt for R {
         len: usize,
         mut func: impl FnMut(&mut Self) -> Result<T, super::Error>,
     ) -> Result<Vec<T>, super::Error> {
-        let mut buf = Vec::with_capacity(len);
-        for _ in 0..buf.capacity() {
+        // `len` comes from the file: don't trust it for the allocation size.
+        let mut buf = Vec::with_capacity(len.min(4096));
+        for _ in 0..len {
             buf.push(func(self)?);
         }
         Ok(buf)
@@ -68,6 +69,10 @@ impl<R: std::io::Read> ReadExt for R {
 
     fn read_string(&mut self) -> Result<String, super::Error> {
         let len = self.read_i32::<LE>()?;
+        // Unreal paths are far shorter; a larger value means corrupt data.
+        if len.unsigned_abs() > 1 << 16 {
+            return Err(super::Error::InvalidIndex(format!("string length {len}")));
+        }
         if len < 0 {
             let chars = self.read_array_len((-len) as usize, |r| Ok(r.read_u16::<LE>()?))?;
             let length = chars.iter().position(|&c| c == 0).unwrap_or(chars.len());

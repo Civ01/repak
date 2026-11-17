@@ -192,7 +192,12 @@ impl PakReader {
                 Err(err) => {
                     writeln!(log, "trying version {} failed: {}", ver, err)?;
                     match err {
-                        super::Error::Encrypted => decisive = Some(err),
+                        super::Error::WrongKey => decisive = Some(err),
+                        super::Error::Encrypted
+                            if !matches!(decisive, Some(super::Error::WrongKey)) =>
+                        {
+                            decisive = Some(err)
+                        }
                         super::Error::UnsupportedVersion(_) if decisive.is_none() => {
                             decisive = Some(err)
                         }
@@ -437,8 +442,20 @@ impl Pak {
         #[allow(unused)] key: &super::Key,
     ) -> Result<Self, super::Error> {
         // read footer to get index, encryption & compression info
-        reader.seek(io::SeekFrom::End(-version.size()))?;
+        let footer_pos = reader.seek(io::SeekFrom::End(-version.size()))?;
         let footer = super::footer::Footer::read(reader, version)?;
+        // the index must lie before the footer; guards against huge allocations
+        // from a garbage footer
+        if footer
+            .index_offset
+            .checked_add(footer.index_size)
+            .is_none_or(|end| end > footer_pos)
+        {
+            return Err(super::Error::InvalidIndex(format!(
+                "index {}+{} lies outside the file (footer at {footer_pos})",
+                footer.index_offset, footer.index_size
+            )));
+        }
         // read index to get all the entry info
         reader.seek(io::SeekFrom::Start(footer.index_offset))?;
         #[allow(unused_mut)]
@@ -449,7 +466,19 @@ impl Pak {
             #[cfg(not(feature = "encryption"))]
             return Err(super::Error::Encryption);
             #[cfg(feature = "encryption")]
-            decrypt(key, &mut index)?;
+            {
+                decrypt(key, &mut index)?;
+                // The footer stores the SHA-1 of the decrypted index (as Unreal
+                // checks it): a mismatch means the key is wrong. Checked before
+                // parsing, so garbage is never interpreted.
+                if footer.hash.0 != [0; 20] {
+                    use sha1::{Digest, Sha1};
+                    let actual: [u8; 20] = Sha1::digest(&index).into();
+                    if actual != footer.hash.0 {
+                        return Err(super::Error::WrongKey);
+                    }
+                }
+            }
         }
 
         let mut index = io::Cursor::new(index);

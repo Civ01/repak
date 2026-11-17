@@ -76,6 +76,12 @@ pub enum Error {
     #[error("pak version {0} is not supported")]
     UnsupportedVersion(u32),
 
+    #[error("AES key does not match this pak")]
+    WrongKey,
+
+    #[error("invalid index: {0}")]
+    InvalidIndex(String),
+
     #[error("error with OsString")]
     OsString(std::ffi::OsString),
 

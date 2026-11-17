@@ -430,3 +430,36 @@ fn unknown_future_version_is_rejected_not_misparsed() {
         .unwrap_err();
     assert!(matches!(err, repak::Error::UnsupportedVersion(99)), "{err}");
 }
+
+#[test]
+fn wrong_key_is_detected_before_parsing() {
+    use aes::cipher::KeyInit;
+    let bytes = include_bytes!("packs/pack_v11_encrypt_encryptindex.pak");
+    let wrong = aes::Aes256::new_from_slice(&[0x11; 32]).unwrap();
+    let err = repak::PakBuilder::new()
+        .key(wrong)
+        .reader(&mut std::io::Cursor::new(&bytes[..]))
+        .unwrap_err();
+    assert!(matches!(err, repak::Error::WrongKey), "{err}");
+    let err = repak::PakBuilder::new()
+        .reader(&mut std::io::Cursor::new(&bytes[..]))
+        .unwrap_err();
+    assert!(matches!(err, repak::Error::Encrypted), "{err}");
+}
+
+#[test]
+fn garbage_index_location_is_rejected() {
+    let mut buf = std::io::Cursor::new(vec![]);
+    let mut w = repak::PakBuilder::new().writer(&mut buf, repak::Version::V11, "../../../".into(), None);
+    w.write_file("a.txt", false, b"hello").unwrap();
+    w.write_index().unwrap();
+    let mut bytes = buf.into_inner();
+    let magic = 0x5A6F12E1u32.to_le_bytes();
+    let pos = bytes.windows(4).rposition(|w| w == magic).unwrap();
+    // index size = u64::MAX / 2
+    bytes[pos + 16..pos + 24].copy_from_slice(&(u64::MAX / 2).to_le_bytes());
+    let err = repak::PakBuilder::new()
+        .reader_with_version(&mut std::io::Cursor::new(bytes), repak::Version::V11)
+        .unwrap_err();
+    assert!(matches!(err, repak::Error::InvalidIndex(_)), "{err}");
+}
