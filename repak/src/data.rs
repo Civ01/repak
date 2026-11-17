@@ -134,16 +134,19 @@ impl<D: AsRef<[u8]>> PartialEntry<D> {
     }
 }
 
+/// repak's historical default: the largest block size that fits the compact
+/// encoding in the entry flags (readable by every engine version).
+pub const DEFAULT_COMPRESSION_BLOCK_SIZE: u32 = 0x3e << 11;
+
 pub(crate) fn build_partial_entry<D>(
     allowed_compression: &[Compression],
+    compression_block_size: u32,
     data: D,
 ) -> Result<PartialEntry<D>>
 where
     D: AsRef<[u8]>,
 {
-    // TODO hash needs to be post-compression/encryption
     use sha1::{Digest, Sha1};
-    let mut hasher = Sha1::new();
 
     // Empty data cannot be compressed (would produce empty blocks causing decompression failures)
     let compression = if data.as_ref().is_empty() {
@@ -153,46 +156,49 @@ where
         allowed_compression.first().cloned()
     };
     let uncompressed_size = data.as_ref().len() as u64;
-    let compression_block_size;
 
-    let (data, compressed_size) = match compression {
-        #[cfg(not(feature = "compression"))]
-        Some(_) => {
-            unreachable!("should not be able to reach this point without compression feature")
+    #[cfg(feature = "compression")]
+    if let Some(compression) = compression {
+        // https://github.com/EpicGames/UnrealEngine/commit/3aad0ff7976be1073005dca2c1282af548b45d89
+        // Block sizes above DEFAULT_COMPRESSION_BLOCK_SIZE need the extended
+        // encoding, which older engine versions cannot read.
+        let block_size = compression_block_size.max(1);
+        let mut compressed_size = 0;
+        let mut blocks = vec![];
+        for chunk in data.as_ref().chunks(block_size as usize) {
+            let data = compress(compression, chunk)?;
+            compressed_size += data.len() as u64;
+            blocks.push(PartialBlock {
+                uncompressed_size: chunk.len(),
+                data,
+            })
         }
-        #[cfg(feature = "compression")]
-        Some(compression) => {
-            // https://github.com/EpicGames/UnrealEngine/commit/3aad0ff7976be1073005dca2c1282af548b45d89
-            // Block size must fit into flags field or it may cause unreadable paks for earlier Unreal Engine versions
-            compression_block_size = 0x3e << 11; // max possible block size
-            let mut compressed_size = 0;
-            let mut blocks = vec![];
-            for chunk in data.as_ref().chunks(compression_block_size as usize) {
-                let data = compress(compression, chunk)?;
-                compressed_size += data.len() as u64;
-                hasher.update(&data);
-                blocks.push(PartialBlock {
-                    uncompressed_size: chunk.len(),
-                    data,
-                })
+        // Like UnrealPak: keep the entry uncompressed if compression doesn't help.
+        if compressed_size < uncompressed_size {
+            let mut hasher = Sha1::new();
+            for block in &blocks {
+                hasher.update(&block.data);
             }
-
-            (PartialEntryData::Blocks(blocks), compressed_size)
+            return Ok(PartialEntry {
+                compression: Some(compression),
+                compressed_size,
+                uncompressed_size,
+                compression_block_size: block_size,
+                data: PartialEntryData::Blocks(blocks),
+                hash: Hash(hasher.finalize().into()),
+            });
         }
-        None => {
-            compression_block_size = 0;
-            hasher.update(data.as_ref());
-            (PartialEntryData::Slice(data), uncompressed_size)
-        }
-    };
+    }
+    #[cfg(not(feature = "compression"))]
+    let _ = (compression, compression_block_size);
 
     Ok(PartialEntry {
-        compression,
-        compressed_size,
+        compression: None,
+        compressed_size: uncompressed_size,
         uncompressed_size,
-        compression_block_size,
-        data,
-        hash: Hash(hasher.finalize().into()),
+        compression_block_size: 0,
+        hash: Hash(Sha1::digest(data.as_ref()).into()),
+        data: PartialEntryData::Slice(data),
     })
 }
 

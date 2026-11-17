@@ -20,6 +20,7 @@ impl std::fmt::Debug for Hash {
 pub struct PakBuilder {
     key: super::Key,
     allowed_compression: Vec<Compression>,
+    compression_block_size: u32,
 }
 
 impl Default for PakBuilder {
@@ -33,6 +34,7 @@ impl PakBuilder {
         Self {
             key: Default::default(),
             allowed_compression: Default::default(),
+            compression_block_size: crate::data::DEFAULT_COMPRESSION_BLOCK_SIZE,
         }
     }
     #[cfg(feature = "encryption")]
@@ -43,6 +45,13 @@ impl PakBuilder {
     #[cfg(feature = "compression")]
     pub fn compression(mut self, compression: impl IntoIterator<Item = Compression>) -> Self {
         self.allowed_compression = compression.into_iter().collect();
+        self
+    }
+    /// Uncompressed size of each compression block when writing. Default:
+    /// [`DEFAULT_COMPRESSION_BLOCK_SIZE`](crate::DEFAULT_COMPRESSION_BLOCK_SIZE)
+    /// (126,976 bytes); UnrealPak uses 65,536.
+    pub fn compression_block_size(mut self, size: u32) -> Self {
+        self.compression_block_size = size;
         self
     }
     pub fn reader<R: Read + Seek>(self, reader: &mut R) -> Result<PakReader, super::Error> {
@@ -69,6 +78,7 @@ impl PakBuilder {
             mount_point,
             path_hash_seed,
             self.allowed_compression,
+            self.compression_block_size,
         )
     }
 }
@@ -100,6 +110,7 @@ pub struct PakWriter<W: Write + Seek> {
     writer: W,
     key: super::Key,
     allowed_compression: Vec<Compression>,
+    compression_block_size: u32,
 }
 
 #[derive(Debug)]
@@ -320,6 +331,7 @@ impl PakReader {
         writer.seek(io::SeekFrom::Start(self.pak.index_offset.unwrap()))?;
         Ok(PakWriter {
             allowed_compression: self.pak.compression.iter().filter_map(|c| *c).collect(),
+            compression_block_size: crate::data::DEFAULT_COMPRESSION_BLOCK_SIZE,
             pak: self.pak,
             key: self.key,
             writer,
@@ -335,12 +347,14 @@ impl<W: Write + Seek> PakWriter<W> {
         mount_point: String,
         path_hash_seed: Option<u64>,
         allowed_compression: Vec<Compression>,
+        compression_block_size: u32,
     ) -> Self {
         PakWriter {
             pak: Pak::new(version, mount_point, path_hash_seed),
             writer,
             key,
             allowed_compression,
+            compression_block_size,
         }
     }
 
@@ -365,6 +379,7 @@ impl<W: Write + Seek> PakWriter<W> {
                 } else {
                     &[]
                 },
+                self.compression_block_size,
                 data.as_ref(),
             )?,
         );
@@ -375,6 +390,7 @@ impl<W: Write + Seek> PakWriter<W> {
     pub fn entry_builder(&self) -> EntryBuilder {
         EntryBuilder {
             allowed_compression: self.allowed_compression.clone(),
+            compression_block_size: self.compression_block_size,
         }
     }
 
@@ -418,6 +434,7 @@ impl AsRef<[u8]> for Data<'_> {
 #[derive(Clone)]
 pub struct EntryBuilder {
     allowed_compression: Vec<Compression>,
+    compression_block_size: u32,
 }
 impl EntryBuilder {
     /// Builds an entry in memory (compressed if requested) which must be written out later
@@ -431,7 +448,7 @@ impl EntryBuilder {
         } else {
             &[]
         };
-        build_partial_entry(compression, data)
+        build_partial_entry(compression, self.compression_block_size, data)
     }
 }
 

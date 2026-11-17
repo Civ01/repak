@@ -463,3 +463,35 @@ fn garbage_index_location_is_rejected() {
         .unwrap_err();
     assert!(matches!(err, repak::Error::InvalidIndex(_)), "{err}");
 }
+
+#[test]
+fn block_size_and_uncompressible_fallback() {
+    let compressible = b"abcd".repeat(70_000); // 280,000 bytes
+    let mut x: u64 = 0x9E3779B97F4A7C15;
+    let random: Vec<u8> = (0..50_000)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 24) as u8
+        })
+        .collect();
+    let mut buf = std::io::Cursor::new(vec![]);
+    let mut w = repak::PakBuilder::new()
+        .compression([repak::Compression::Zlib])
+        .compression_block_size(65536)
+        .writer(&mut buf, repak::Version::V11, "../../../".into(), None);
+    w.write_file("c.bin", true, &compressible).unwrap();
+    w.write_file("r.bin", true, &random).unwrap();
+    w.write_index().unwrap();
+    let bytes = buf.into_inner();
+    let mut r = std::io::Cursor::new(&bytes);
+    let pak = repak::PakBuilder::new().reader(&mut r).unwrap();
+    let c = pak.entry("c.bin").unwrap();
+    assert_eq!(c.compression, Some(repak::Compression::Zlib));
+    assert!(c.compressed_size < c.uncompressed_size);
+    let rnd = pak.entry("r.bin").unwrap();
+    assert_eq!(rnd.compression, None, "stored when compression doesn't help");
+    assert_eq!(pak.get("c.bin", &mut r).unwrap(), compressible);
+    assert_eq!(pak.get("r.bin", &mut r).unwrap(), random);
+}

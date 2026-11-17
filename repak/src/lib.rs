@@ -6,7 +6,11 @@ mod ext;
 mod footer;
 mod pak;
 
-pub use {data::PartialEntry, error::*, pak::*};
+pub use {
+    data::{PartialEntry, DEFAULT_COMPRESSION_BLOCK_SIZE},
+    error::*,
+    pak::*,
+};
 
 pub const MAGIC: u32 = 0x5A6F12E1;
 
