@@ -290,6 +290,30 @@ impl PakReader {
         self.pak.encryption_guid
     }
 
+    /// A writer for a new, empty pak like this one (version, mount point,
+    /// path hash seed, compression slots, index encryption, key GUID and
+    /// key), writing from `writer`'s current position. Fill it with
+    /// [`PakWriter::copy_entry`] (compacting) and new files.
+    pub fn new_pakwriter_like<W: Write + Seek>(&self, writer: W) -> PakWriter<W> {
+        PakWriter {
+            pak: Pak {
+                version: self.pak.version,
+                mount_point: self.pak.mount_point.clone(),
+                index_offset: None,
+                index: Index::new(self.pak.index.path_hash_seed),
+                encrypted_index: self.pak.encrypted_index,
+                encryption_guid: self.pak.encryption_guid,
+                compression: self.pak.compression.clone(),
+            },
+            writer,
+            key: self.key.clone(),
+            encrypt_entries: false,
+            allowed_compression: self.pak.compression.iter().filter_map(|c| *c).collect(),
+            compression_block_size: crate::data::DEFAULT_COMPRESSION_BLOCK_SIZE,
+            compression_options: Default::default(),
+        }
+    }
+
     pub fn path_hash_seed(&self) -> Option<u64> {
         self.pak.index.path_hash_seed
     }
@@ -527,6 +551,86 @@ impl<W: Write + Seek> PakWriter<W> {
 
     pub fn into_writer(self) -> W {
         self.writer
+    }
+
+    /// Copies entry `path` of `from` (read from `src`) into this pak as
+    /// `new_path`, stored bytes as they are: no recompression, no
+    /// re-encryption (encrypted entries need no key). Used for compacting.
+    /// Both paks must have the same version. `progress(bytes)` is called as
+    /// data is copied; `false` aborts with `Error::Cancelled`.
+    pub fn copy_entry<R: Read + Seek>(
+        &mut self,
+        from: &PakReader,
+        path: &str,
+        new_path: &str,
+        src: &mut R,
+        progress: &mut dyn FnMut(u64) -> bool,
+    ) -> Result<(), super::Error> {
+        let version = self.pak.version;
+        if from.pak.version != version {
+            return Err(super::Error::Other(format!(
+                "can't copy entries between versions {:?} and {version:?}",
+                from.pak.version
+            )));
+        }
+        let entry = from
+            .pak
+            .index
+            .entries()
+            .get(path)
+            .ok_or_else(|| super::Error::MissingEntry(path.to_owned()))?;
+        src.seek(io::SeekFrom::Start(entry.offset))?;
+        let mut copy = super::entry::Entry::read(src, version)?;
+        let data_start = src.stream_position()?;
+        let data_end = entry_data_end(entry, version);
+        if data_end < data_start {
+            return Err(super::Error::InvalidIndex(format!(
+                "{path}: entry ends before its data"
+            )));
+        }
+        let new_offset = self.writer.stream_position()?;
+        copy.offset = new_offset;
+        copy.flags = entry.flags;
+        // the same compression method in this pak's slots
+        if let Some(slot) = copy.compression_slot {
+            let method = from
+                .pak
+                .compression
+                .get(slot as usize)
+                .copied()
+                .flatten()
+                .ok_or_else(|| {
+                    super::Error::Other(format!("{path}: unknown compression slot {slot}"))
+                })?;
+            copy.compression_slot = Some(crate::data::get_compression_slot(
+                version,
+                &mut self.pak.compression,
+                method,
+            )?);
+        }
+        // block offsets are absolute before v5: move them with the entry
+        if version.version_major() < VersionMajor::RelativeChunkOffsets {
+            if let Some(blocks) = copy.blocks.as_mut() {
+                for b in blocks {
+                    b.start = b.start - entry.offset + new_offset;
+                    b.end = b.end - entry.offset + new_offset;
+                }
+            }
+        }
+        copy.write(&mut self.writer, version, super::entry::EntryLocation::Data)?;
+        let mut left = data_end - data_start;
+        let mut chunk = vec![0u8; (1u64 << 20).min(left.max(1)) as usize];
+        while left > 0 {
+            let n = left.min(chunk.len() as u64) as usize;
+            src.read_exact(&mut chunk[..n])?;
+            self.writer.write_all(&chunk[..n])?;
+            left -= n as u64;
+            if !progress(n as u64) {
+                return Err(super::Error::Cancelled);
+            }
+        }
+        self.pak.index.add_entry(new_path.to_owned(), copy);
+        Ok(())
     }
 
     pub fn write_file(

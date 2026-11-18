@@ -1139,3 +1139,123 @@ fn real_encrypted_pak_index_rewrite_reads_back() {
     let after: Vec<_> = p.entries().map(|(p, e)| (p.to_string(), e)).collect();
     assert_eq!(before, after);
 }
+
+/// Copying every entry (in file order) into a `new_pakwriter_like` pak
+/// rebuilds UnrealPak's test paks byte for byte, encrypted ones included
+/// (no key needed for the data: stored bytes are copied as they are).
+#[test]
+fn compact_copy_rebuilds_test_packs_identically() {
+    use aes::cipher::KeyInit;
+    let key = aes::Aes256::new_from_slice(
+        &base64::Engine::decode(&base64::engine::general_purpose::STANDARD, AES_KEY).unwrap(),
+    )
+    .unwrap();
+    let mut n = 0;
+    for path in std::fs::read_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/packs")).unwrap() {
+        let path = path.unwrap().path();
+        let bytes = std::fs::read(&path).unwrap();
+        let mut r = Cursor::new(&bytes);
+        let pak = repak::PakBuilder::new()
+            .key(key.clone())
+            .reader(&mut r)
+            .unwrap();
+        let mut order: Vec<(u64, String)> = pak
+            .entries()
+            .map(|(p, e)| (e.offset, p.to_string()))
+            .collect();
+        order.sort();
+        let mut w = pak.new_pakwriter_like(Cursor::new(vec![]));
+        let mut copied = 0u64;
+        for (_, p) in &order {
+            w.copy_entry(&pak, p, p, &mut r, &mut |b| {
+                copied += b;
+                true
+            })
+            .unwrap();
+        }
+        let out = w.write_index().unwrap().into_inner();
+        let name = path.file_name().unwrap().to_string_lossy().to_string();
+        assert!(out == bytes, "{name}: compacted copy differs");
+        assert!(copied > 0, "{name}");
+        n += 1;
+    }
+    assert_eq!(n, 48);
+}
+
+/// Compacting drops dead space: the result equals a fresh pak written with
+/// only the kept files, for absolute (v3) and relative (v5+) block offsets,
+/// plain and encrypted.
+#[test]
+fn compact_drops_dead_space() {
+    use aes::cipher::KeyInit;
+    use repak::Version::*;
+    let key = aes::Aes256::new_from_slice(&[0x42; 32]).unwrap();
+    let files: Vec<(&str, Vec<u8>)> = vec![
+        ("a/first", b"first ".repeat(40_000)),
+        ("b/second", b"second!".repeat(30_000)),
+        (
+            "c/third",
+            (0..100_000u32).map(|i| (i * 7 % 251) as u8).collect(),
+        ),
+    ];
+    let mut checked = 0;
+    for v in [V3, V4, V5, V7, V8B, V9, V11] {
+        for encrypt in [false, true] {
+            if encrypt && v < V4 {
+                continue;
+            }
+            let build = |names: &[&str]| {
+                let mut w = repak::PakBuilder::new()
+                    .key(key.clone())
+                    .compression([repak::Compression::Zlib])
+                    .compression_block_size(65536)
+                    .writer(Cursor::new(vec![]), v, "../../../G/".into(), Some(7));
+                w.set_encrypt_entries(encrypt);
+                w.set_encrypt_index(encrypt);
+                for (n, d) in &files {
+                    if names.contains(n) {
+                        w.write_file(n, true, d).unwrap();
+                    }
+                }
+                w.write_index().unwrap().into_inner()
+            };
+            let full = build(&["a/first", "b/second", "c/third"]);
+            let expected = build(&["b/second", "c/third"]);
+            let mut r = Cursor::new(&full);
+            let pak = repak::PakBuilder::new()
+                .key(key.clone())
+                .reader(&mut r)
+                .unwrap();
+            let mut w = pak.new_pakwriter_like(Cursor::new(vec![]));
+            w.set_compression_block_size(65536);
+            for p in ["b/second", "c/third"] {
+                w.copy_entry(&pak, p, p, &mut r, &mut |_| true).unwrap();
+            }
+            let mut cancelled = pak.new_pakwriter_like(Cursor::new(vec![]));
+            assert!(matches!(
+                cancelled.copy_entry(
+                    &pak,
+                    "c/third",
+                    "c/third",
+                    &mut Cursor::new(&full),
+                    &mut |_| false
+                ),
+                Err(repak::Error::Cancelled)
+            ));
+            let out = w.write_index().unwrap().into_inner();
+            assert!(out == expected, "{v:?} encrypt={encrypt}");
+            let mut r = Cursor::new(&out);
+            let p = repak::PakBuilder::new()
+                .key(key.clone())
+                .reader(&mut r)
+                .unwrap();
+            for (n, d) in &files[1..] {
+                let mut got = vec![];
+                p.read_file_verified(n, &mut r, &mut got).unwrap();
+                assert_eq!(&got, d);
+            }
+            checked += 1;
+        }
+    }
+    assert_eq!(checked, 13);
+}
