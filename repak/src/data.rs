@@ -243,7 +243,11 @@ where
 }
 
 #[cfg(feature = "compression")]
-pub(crate) fn compress(compression: Compression, options: &CompressionOptions, data: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn compress(
+    compression: Compression,
+    options: &CompressionOptions,
+    data: &[u8],
+) -> Result<Vec<u8>> {
     use std::io::Write;
 
     let compressed = match compression {

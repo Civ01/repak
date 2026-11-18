@@ -113,7 +113,11 @@ fn entry_data_end(entry: &super::entry::Entry, version: super::Version) -> u64 {
     let align = |v: u64| (v + 15) & !15;
     let blocks = entry.blocks.as_ref().map_or(0, |b| b.len() as u32);
     let header = super::entry::Entry::get_serialized_size(version, entry.compression_slot, blocks);
-    let stored = if entry.is_encrypted() { align(entry.compressed) } else { entry.compressed };
+    let stored = if entry.is_encrypted() {
+        align(entry.compressed)
+    } else {
+        entry.compressed
+    };
     let mut end = entry.offset + header + stored;
     if let Some(last) = entry.blocks.as_ref().and_then(|b| b.last()) {
         let abs = if version.version_major() >= super::VersionMajor::RelativeChunkOffsets {
@@ -121,7 +125,11 @@ fn entry_data_end(entry: &super::entry::Entry, version: super::Version) -> u64 {
         } else {
             last.end
         };
-        let abs = if entry.is_encrypted() { entry.offset + header + align(abs - entry.offset - header) } else { abs };
+        let abs = if entry.is_encrypted() {
+            entry.offset + header + align(abs - entry.offset - header)
+        } else {
+            abs
+        };
         end = end.max(abs);
     }
     end
@@ -138,6 +146,8 @@ pub struct PakWriter<W: Write + Seek> {
     pak: Pak,
     writer: W,
     key: super::Key,
+    /// Encrypt entries written from now on (needs a key).
+    encrypt_entries: bool,
     allowed_compression: Vec<Compression>,
     compression_block_size: u32,
     compression_options: crate::CompressionOptions,
@@ -383,10 +393,7 @@ impl PakReader {
             .collect()
     }
 
-    pub fn into_pakwriter<W: Write + Seek>(
-        self,
-        writer: W,
-    ) -> Result<PakWriter<W>, super::Error> {
+    pub fn into_pakwriter<W: Write + Seek>(self, writer: W) -> Result<PakWriter<W>, super::Error> {
         let at = self.pak.index_offset.unwrap();
         self.into_pakwriter_at(writer, at)
     }
@@ -413,6 +420,7 @@ impl PakReader {
             compression_options: Default::default(),
             pak: self.pak,
             key: self.key,
+            encrypt_entries: false,
             writer,
         })
     }
@@ -434,6 +442,33 @@ impl<W: Write + Seek> PakWriter<W> {
 
     pub fn version(&self) -> super::Version {
         self.pak.version
+    }
+
+    /// Encrypt entries written from now on with the key given to the
+    /// builder/reader (AES-256-ECB, padded as UnrealPak pads). Empty files
+    /// are never encrypted. Writing fails with `Error::Encrypted` without a
+    /// key.
+    pub fn set_encrypt_entries(&mut self, encrypt: bool) {
+        self.encrypt_entries = encrypt;
+    }
+
+    pub fn encrypt_entries(&self) -> bool {
+        self.encrypt_entries
+    }
+
+    /// Encrypt the index when it is written (kept from the source pak when
+    /// reopened for editing).
+    pub fn set_encrypt_index(&mut self, encrypt: bool) {
+        self.pak.encrypted_index = encrypt;
+    }
+
+    pub fn encrypt_index(&self) -> bool {
+        self.pak.encrypted_index
+    }
+
+    /// Key GUID written to the footer (v7+; kept from the source pak).
+    pub fn set_encryption_guid(&mut self, guid: Option<u128>) {
+        self.pak.encryption_guid = guid;
     }
 
     pub fn mount_point(&self) -> &str {
@@ -483,6 +518,7 @@ impl<W: Write + Seek> PakWriter<W> {
             pak: Pak::new(version, mount_point, path_hash_seed),
             writer,
             key,
+            encrypt_entries: false,
             allowed_compression,
             compression_block_size,
             compression_options,
@@ -499,6 +535,17 @@ impl<W: Write + Seek> PakWriter<W> {
         allow_compress: bool,
         data: impl AsRef<[u8]>,
     ) -> Result<(), super::Error> {
+        if self.encrypt_entries {
+            let data = data.as_ref();
+            let mut source = io::Cursor::new(data);
+            return self.write_file_from_reader(
+                path,
+                allow_compress,
+                &mut source,
+                data.len() as u64,
+                &mut |_| true,
+            );
+        }
         self.pak.index.add_entry(
             path.to_string(),
             Entry::write_file(
@@ -532,6 +579,11 @@ impl<W: Write + Seek> PakWriter<W> {
         path: String,
         partial_entry: PartialEntry<D>,
     ) -> Result<(), Error> {
+        if self.encrypt_entries {
+            return Err(Error::Other(
+                "write_entry can't encrypt; use write_file or write_file_from_reader".into(),
+            ));
+        }
         let stream_position = self.writer.stream_position()?;
 
         let entry = partial_entry.build_entry(
@@ -574,6 +626,7 @@ impl<W: Write + Seek> PakWriter<W> {
             &self.compression_options,
             source,
             size,
+            crate::entry::cipher_for(&self.key, self.encrypt_entries)?,
             progress,
         )?;
         self.pak.index.add_entry(path.to_string(), entry);
@@ -804,12 +857,29 @@ impl Pak {
         })
     }
 
-    fn write<W: Write + Seek>(
-        &self,
-        writer: &mut W,
-        _key: &super::Key,
-    ) -> Result<(), super::Error> {
+    fn write<W: Write + Seek>(&self, writer: &mut W, key: &super::Key) -> Result<(), super::Error> {
         let index_offset = writer.stream_position()?;
+        // Encrypted index (as UnrealPak writes it, checked against real paks):
+        // each part (primary index, path hash index, full directory index) is
+        // padded to 16 bytes by repeating its first bytes, hashed (padded
+        // plaintext), then encrypted; each part starts after the previous
+        // padded one.
+        let cipher = crate::entry::cipher_for(key, self.encrypted_index)?;
+        let padded = |len: u64| match cipher {
+            Some(_) => (len + 15) & !15,
+            None => len,
+        };
+        let pad = |buf: &mut Vec<u8>| {
+            if cipher.is_some() && !buf.is_empty() {
+                let fill = buf[..buf.len().min(16)].to_vec();
+                let target = padded(buf.len() as u64) as usize;
+                let mut i = 0;
+                while buf.len() < target {
+                    buf.push(fill[i % fill.len()]);
+                    i += 1;
+                }
+            }
+        };
 
         let mut index_buf = vec![];
         let mut index_writer = io::Cursor::new(&mut index_buf);
@@ -880,7 +950,7 @@ impl Pak {
                 size
             };
 
-            let path_hash_index_offset = index_offset + bytes_before_phi;
+            let path_hash_index_offset = index_offset + padded(bytes_before_phi);
 
             let mut phi_buf = vec![];
             let mut phi_writer = io::Cursor::new(&mut phi_buf);
@@ -890,12 +960,14 @@ impl Pak {
                 &self.index.entries,
                 &offsets,
             )?;
+            pad(&mut phi_buf);
 
             let full_directory_index_offset = path_hash_index_offset + phi_buf.len() as u64;
 
             let mut fdi_buf = vec![];
             let mut fdi_writer = io::Cursor::new(&mut fdi_buf);
             generate_full_directory_index(&mut fdi_writer, &self.index.entries, &offsets)?;
+            pad(&mut fdi_buf);
 
             index_writer.write_u32::<LE>(1)?; // we have path hash index
             index_writer.write_u64::<LE>(path_hash_index_offset)?;
@@ -915,18 +987,23 @@ impl Pak {
             Some((phi_buf, fdi_buf))
         };
 
+        pad(&mut index_buf);
         let index_hash = hash(&index_buf);
+        let seal = |buf: &mut Vec<u8>| crate::entry::seal(cipher, buf, &[0]);
 
+        seal(&mut index_buf);
         writer.write_all(&index_buf)?;
 
-        if let Some((phi_buf, fdi_buf)) = secondary_index {
+        if let Some((mut phi_buf, mut fdi_buf)) = secondary_index {
+            seal(&mut phi_buf);
+            seal(&mut fdi_buf);
             writer.write_all(&phi_buf[..])?;
             writer.write_all(&fdi_buf[..])?;
         }
 
         let footer = super::footer::Footer {
-            encryption_uuid: None,
-            encrypted: false,
+            encryption_uuid: self.encryption_guid,
+            encrypted: self.encrypted_index,
             magic: super::MAGIC,
             version: self.version,
             version_major: self.version.version_major(),
@@ -1030,14 +1107,6 @@ fn generate_full_directory_index<W: Write>(
     }
 
     Ok(())
-}
-
-#[cfg(feature = "encryption")]
-fn encrypt(key: aes::Aes256, bytes: &mut [u8]) {
-    use aes::cipher::BlockEncrypt;
-    for chunk in bytes.chunks_mut(16) {
-        key.encrypt_block(aes::Block::from_mut_slice(chunk))
-    }
 }
 
 #[cfg(test)]

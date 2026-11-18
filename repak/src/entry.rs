@@ -31,6 +31,48 @@ impl Block {
     }
 }
 
+#[cfg(feature = "encryption")]
+pub(crate) type Cipher<'a> = Option<&'a aes::Aes256>;
+#[cfg(not(feature = "encryption"))]
+pub(crate) type Cipher<'a> = Option<&'a std::convert::Infallible>;
+
+/// The cipher for writing an entry: `None` when not encrypting.
+pub(crate) fn cipher_for(key: &super::Key, encrypt: bool) -> Result<Cipher<'_>, Error> {
+    if !encrypt {
+        return Ok(None);
+    }
+    #[cfg(feature = "encryption")]
+    return match key {
+        super::Key::Some(k) => Ok(Some(k)),
+        _ => Err(Error::Encrypted),
+    };
+    #[cfg(not(feature = "encryption"))]
+    {
+        let _ = key;
+        Err(Error::Encryption)
+    }
+}
+
+/// Pads `data` to the AES block size the way UnrealPak does (repeating the
+/// bytes of `fill`, normally the start of the entry's data) and encrypts it
+/// in place (AES-256-ECB). No-op without a cipher.
+pub(crate) fn seal(cipher: Cipher<'_>, data: &mut Vec<u8>, fill: &[u8]) {
+    let Some(_key) = cipher else { return };
+    let target = align(data.len() as u64) as usize;
+    let mut i = 0;
+    while data.len() < target {
+        data.push(fill[i % fill.len()]);
+        i += 1;
+    }
+    #[cfg(feature = "encryption")]
+    {
+        use aes::cipher::BlockEncrypt;
+        for chunk in data.chunks_mut(16) {
+            _key.encrypt_block(aes::Block::from_mut_slice(chunk))
+        }
+    }
+}
+
 fn align(offset: u64) -> u64 {
     // add alignment (aes block size: 16) then zero out alignment bits
     (offset + 15) & !15
@@ -130,12 +172,20 @@ impl Entry {
         options: &crate::CompressionOptions,
         source: &mut R,
         size: u64,
+        cipher: Cipher<'_>,
         progress: &mut dyn FnMut(u64) -> bool,
     ) -> Result<Self, Error> {
         use sha1::{Digest, Sha1};
+        // empty files are never encrypted (as UnrealPak does)
+        let cipher = if size == 0 { None } else { cipher };
+        let flags = cipher.is_some() as u8;
         let start = writer.stream_position()?;
         let source_start = source.stream_position()?;
-        let compression = if size == 0 { None } else { allowed_compression.first().copied() };
+        let compression = if size == 0 {
+            None
+        } else {
+            allowed_compression.first().copied()
+        };
 
         #[cfg(feature = "compression")]
         if let Some(comp) = compression {
@@ -155,15 +205,28 @@ impl Entry {
             let mut compressed_size = 0;
             let mut chunk = vec![0u8; block_size.min(size) as usize];
             let mut left = size;
+            // AES padding repeats the start of the entry's first block
+            let mut fill: Vec<u8> = vec![];
             while left > 0 {
                 let n = left.min(block_size) as usize;
                 source.read_exact(&mut chunk[..n])?;
-                let data = crate::data::compress(comp, options, &chunk[..n])?;
+                let mut data = crate::data::compress(comp, options, &chunk[..n])?;
+                let raw_len = data.len() as u64;
+                if cipher.is_some() {
+                    if fill.is_empty() {
+                        fill = data[..data.len().min(16)].to_vec();
+                        if fill.is_empty() {
+                            fill.push(0);
+                        }
+                    }
+                    seal(cipher, &mut data, &fill);
+                }
                 writer.write_all(&data)?;
+                // the hash covers the stored (encrypted) bytes
                 hasher.update(&data);
                 blocks.push(Block {
                     start: offset,
-                    end: offset + data.len() as u64,
+                    end: offset + raw_len,
                 });
                 offset += data.len() as u64;
                 compressed_size += data.len() as u64;
@@ -182,7 +245,7 @@ impl Entry {
                     timestamp: None,
                     hash: Some(Hash(hasher.finalize().into())),
                     blocks: Some(blocks),
-                    flags: 0,
+                    flags,
                     compression_block_size: block_size as u32,
                 };
                 writer.seek(io::SeekFrom::Start(start))?;
@@ -199,14 +262,30 @@ impl Entry {
         let header = Entry::get_serialized_size(version, None, 0);
         writer.seek(io::SeekFrom::Start(start + header))?;
         let mut hasher = Sha1::new();
+        // 1 MiB: a multiple of the AES block size, so only the last chunk pads
         let mut chunk = vec![0u8; (1u64 << 20).min(size.max(1)) as usize];
         let mut left = size;
         let reported = compression.is_some();
+        let mut fill: Vec<u8> = vec![];
+        let mut sealed = vec![];
         while left > 0 {
             let n = left.min(chunk.len() as u64) as usize;
             source.read_exact(&mut chunk[..n])?;
-            writer.write_all(&chunk[..n])?;
-            hasher.update(&chunk[..n]);
+            if cipher.is_some() {
+                if fill.is_empty() {
+                    fill = chunk[..n.min(16)].to_vec();
+                }
+                sealed.clear();
+                sealed.extend_from_slice(&chunk[..n]);
+                seal(cipher, &mut sealed, &fill);
+                writer.write_all(&sealed)?;
+                // UnrealPak: the hash covers the encrypted bytes, without
+                // the padding (checked against UnrealPak-made paks)
+                hasher.update(&sealed[..n]);
+            } else {
+                writer.write_all(&chunk[..n])?;
+                hasher.update(&chunk[..n]);
+            }
             left -= n as u64;
             // a raw second pass only checks for Cancel (bytes already reported)
             if !progress(if reported { 0 } else { n as u64 }) {
@@ -221,12 +300,13 @@ impl Entry {
             timestamp: None,
             hash: Some(Hash(hasher.finalize().into())),
             blocks: None,
-            flags: 0,
+            flags,
             compression_block_size: 0,
         };
         writer.seek(io::SeekFrom::Start(start))?;
         entry.write(writer, version, EntryLocation::Data)?;
-        writer.seek(io::SeekFrom::Start(start + header + size))?;
+        let stored = if cipher.is_some() { align(size) } else { size };
+        writer.seek(io::SeekFrom::Start(start + header + stored))?;
         Ok(entry)
     }
 
@@ -454,10 +534,11 @@ impl Entry {
     /// compression block (or 1 MiB for stored entries), whatever the entry
     /// size. With `verify`, the entry's SHA-1 (from the record stored before
     /// the data; v10+ index entries carry none) is checked
-    /// (`Error::HashMismatch`). Verified against real Unreal paks: the hash
-    /// covers the stored bytes; for encrypted compressed entries, the
-    /// encrypted bytes including AES padding. Encrypted uncompressed entries
-    /// are not checked (no reliable rule found).
+    /// (`Error::HashMismatch`). Verified against real Unreal paks and
+    /// UnrealPak-made test paks: the hash covers the stored bytes; for
+    /// encrypted compressed entries, the encrypted bytes including AES
+    /// padding; for encrypted stored entries, the encrypted bytes without
+    /// the padding.
     #[allow(clippy::too_many_arguments)]
     pub fn read_file<R: io::Read + io::Seek, W: io::Write>(
         &self,
@@ -496,98 +577,106 @@ impl Entry {
         // Reads stored bytes [lo, hi) (relative to the data start), decrypting
         // whole AES blocks around the range (ECB: blocks are independent).
         {
-        let mut span = |reader: &mut R, lo: u64, hi: u64| -> Result<Vec<u8>, super::Error> {
-            let (lo16, hi16) = match encrypted {
-                true => (lo & !15, align(hi).min(stored_len)),
-                false => (lo, hi),
+            let mut span = |reader: &mut R, lo: u64, hi: u64| -> Result<Vec<u8>, super::Error> {
+                let (lo16, hi16) = match encrypted {
+                    true => (lo & !15, align(hi).min(stored_len)),
+                    false => (lo, hi),
+                };
+                reader.seek(io::SeekFrom::Start(data_offset + lo16))?;
+                #[allow(unused_mut)]
+                let mut data = reader.read_len((hi16 - lo16) as usize)?;
+                #[cfg(feature = "encryption")]
+                if let Some(key) = cipher {
+                    use aes::cipher::BlockDecrypt;
+                    for block in data.chunks_mut(16) {
+                        key.decrypt_block(aes::Block::from_mut_slice(block))
+                    }
+                }
+                let start = (lo - lo16) as usize;
+                data.drain(..start);
+                data.truncate((hi - lo) as usize);
+                if let Some(h) = hasher.as_mut() {
+                    h.update(&data);
+                }
+                Ok(data)
             };
-            reader.seek(io::SeekFrom::Start(data_offset + lo16))?;
-            #[allow(unused_mut)]
-            let mut data = reader.read_len((hi16 - lo16) as usize)?;
-            #[cfg(feature = "encryption")]
-            if let Some(key) = cipher {
-                use aes::cipher::BlockDecrypt;
-                for block in data.chunks_mut(16) {
-                    key.decrypt_block(aes::Block::from_mut_slice(block))
-                }
-            }
-            let start = (lo - lo16) as usize;
-            data.drain(..start);
-            data.truncate((hi - lo) as usize);
-            if let Some(h) = hasher.as_mut() {
-                h.update(&data);
-            }
-            Ok(data)
-        };
 
-        const CHUNK: u64 = 1 << 20;
-        match self.compression_slot.and_then(|c| compression[c as usize]) {
-            None => {
-                let mut pos = 0;
-                while pos < self.compressed {
-                    let end = (pos + CHUNK).min(self.compressed);
-                    buf.write_all(&span(reader, pos, end)?)?;
-                    pos = end;
-                }
-            }
-            #[cfg(not(feature = "compression"))]
-            _ => return Err(super::Error::Compression),
-            #[cfg(feature = "compression")]
-            Some(comp) => {
-                let rel = |index: u64| -> u64 {
-                    match version.version_major() >= VersionMajor::RelativeChunkOffsets {
-                        true => index - (data_offset - self.offset),
-                        false => index - data_offset,
+            const CHUNK: u64 = 1 << 20;
+            match self.compression_slot.and_then(|c| compression[c as usize]) {
+                None => {
+                    let mut pos = 0;
+                    while pos < self.compressed {
+                        let end = (pos + CHUNK).min(self.compressed);
+                        buf.write_all(&span(reader, pos, end)?)?;
+                        pos = end;
                     }
-                };
-                let ranges: Vec<(u64, u64)> = match &self.blocks {
-                    Some(blocks) => blocks.iter().map(|b| (rel(b.start), rel(b.end))).collect(),
-                    None => vec![(0, self.compressed)],
-                };
-                let chunk_size = if ranges.len() == 1 {
-                    self.uncompressed
-                } else {
-                    self.compression_block_size as u64
-                };
-                for (i, (lo, hi)) in ranges.iter().enumerate() {
-                    let block = span(reader, *lo, *hi)?;
-                    let out_len = chunk_size.min(self.uncompressed - (i as u64 * chunk_size).min(self.uncompressed));
-                    match comp {
-                        Compression::Zlib => {
-                            io::copy(&mut flate2::read::ZlibDecoder::new(&block[..]), buf)?;
+                }
+                #[cfg(not(feature = "compression"))]
+                _ => return Err(super::Error::Compression),
+                #[cfg(feature = "compression")]
+                Some(comp) => {
+                    let rel = |index: u64| -> u64 {
+                        match version.version_major() >= VersionMajor::RelativeChunkOffsets {
+                            true => index - (data_offset - self.offset),
+                            false => index - data_offset,
                         }
-                        Compression::Gzip => {
-                            io::copy(&mut flate2::read::GzDecoder::new(&block[..]), buf)?;
-                        }
-                        Compression::Zstd => {
-                            io::copy(&mut zstd::stream::read::Decoder::new(&block[..])?, buf)?;
-                        }
-                        Compression::LZ4 => {
-                            let mut out = vec![0; out_len as usize];
-                            lz4_flex::block::decompress_into(&block, &mut out)
-                                .map_err(|_| Error::DecompressionFailed(Compression::LZ4))?;
-                            buf.write_all(&out)?;
-                        }
-                        #[cfg(feature = "oodle_core")]
-                        Compression::Oodle => {
-                            let mut out = vec![0; out_len as usize];
-                            if oodle_loader::oodle()?.decompress(&block, &mut out) == 0 {
-                                return Err(Error::DecompressionFailed(Compression::Oodle));
+                    };
+                    let ranges: Vec<(u64, u64)> = match &self.blocks {
+                        Some(blocks) => blocks.iter().map(|b| (rel(b.start), rel(b.end))).collect(),
+                        None => vec![(0, self.compressed)],
+                    };
+                    let chunk_size = if ranges.len() == 1 {
+                        self.uncompressed
+                    } else {
+                        self.compression_block_size as u64
+                    };
+                    for (i, (lo, hi)) in ranges.iter().enumerate() {
+                        let block = span(reader, *lo, *hi)?;
+                        let out_len = chunk_size.min(
+                            self.uncompressed - (i as u64 * chunk_size).min(self.uncompressed),
+                        );
+                        match comp {
+                            Compression::Zlib => {
+                                io::copy(&mut flate2::read::ZlibDecoder::new(&block[..]), buf)?;
                             }
-                            buf.write_all(&out)?;
+                            Compression::Gzip => {
+                                io::copy(&mut flate2::read::GzDecoder::new(&block[..]), buf)?;
+                            }
+                            Compression::Zstd => {
+                                io::copy(&mut zstd::stream::read::Decoder::new(&block[..])?, buf)?;
+                            }
+                            Compression::LZ4 => {
+                                let mut out = vec![0; out_len as usize];
+                                lz4_flex::block::decompress_into(&block, &mut out)
+                                    .map_err(|_| Error::DecompressionFailed(Compression::LZ4))?;
+                                buf.write_all(&out)?;
+                            }
+                            #[cfg(feature = "oodle_core")]
+                            Compression::Oodle => {
+                                let mut out = vec![0; out_len as usize];
+                                if oodle_loader::oodle()?.decompress(&block, &mut out) == 0 {
+                                    return Err(Error::DecompressionFailed(Compression::Oodle));
+                                }
+                                buf.write_all(&out)?;
+                            }
+                            #[cfg(not(feature = "oodle_core"))]
+                            Compression::Oodle => return Err(super::Error::Oodle),
                         }
-                        #[cfg(not(feature = "oodle_core"))]
-                        Compression::Oodle => return Err(super::Error::Oodle),
                     }
                 }
             }
-        }
         }
         buf.flush()?;
-        if verify && encrypted && compressed_entry {
+        if verify && encrypted {
+            // compressed: all stored bytes incl. padding; stored: the first
+            // `compressed` encrypted bytes (UnrealPak's rules)
             let mut h = Sha1::new();
             reader.seek(io::SeekFrom::Start(data_offset))?;
-            let mut left = stored_len;
+            let mut left = if compressed_entry {
+                stored_len
+            } else {
+                self.compressed
+            };
             let mut chunk = vec![0u8; (1 << 20).min(stored_len.max(1)) as usize];
             while left > 0 {
                 let n = left.min(chunk.len() as u64) as usize;
@@ -608,6 +697,92 @@ impl Entry {
 }
 
 mod test {
+    /// Re-sealing UnrealPak's compressed blocks with our padding rule gives
+    /// its exact stored bytes and entry hash (validates F10 for compressed
+    /// entries; the zlib streams themselves can't be reproduced).
+    #[test]
+    #[cfg(feature = "encryption")]
+    fn seal_matches_unrealpak_blocks() {
+        use aes::cipher::{BlockDecrypt, KeyInit};
+        use sha1::{Digest, Sha1};
+        let key = aes::Aes256::new_from_slice(
+            &base64::Engine::decode(
+                &base64::engine::general_purpose::STANDARD,
+                "lNJbw660IOC+kU7cnVQ1oeqrXyhk4J6UAZrCBbcnp94=",
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let packs: [(&[u8], super::Version); 6] = [
+            (
+                include_bytes!("../tests/packs/pack_v5_compress_encrypt.pak"),
+                super::Version::V5,
+            ),
+            (
+                include_bytes!("../tests/packs/pack_v7_compress_encrypt.pak"),
+                super::Version::V7,
+            ),
+            (
+                include_bytes!("../tests/packs/pack_v8a_compress_encrypt.pak"),
+                super::Version::V8A,
+            ),
+            (
+                include_bytes!("../tests/packs/pack_v8b_compress_encrypt.pak"),
+                super::Version::V8B,
+            ),
+            (
+                include_bytes!("../tests/packs/pack_v9_compress_encrypt.pak"),
+                super::Version::V9,
+            ),
+            (
+                include_bytes!("../tests/packs/pack_v11_compress_encrypt.pak"),
+                super::Version::V11,
+            ),
+        ];
+        let mut checked = 0;
+        for (bytes, version) in packs {
+            let mut r = std::io::Cursor::new(bytes);
+            let pak = crate::PakBuilder::new()
+                .key(key.clone())
+                .reader(&mut r)
+                .unwrap();
+            for (_, info) in pak.entries() {
+                if !(info.encrypted && info.compression.is_some()) {
+                    continue;
+                }
+                let mut c = std::io::Cursor::new(&bytes[info.offset as usize..]);
+                let header = super::Entry::read(&mut c, version).unwrap();
+                let data_start = info.offset as usize + c.position() as usize;
+                let base = if version >= super::Version::V5 {
+                    info.offset
+                } else {
+                    0
+                };
+                let mut out = vec![];
+                let mut fill: Vec<u8> = vec![];
+                for b in header.blocks.as_ref().unwrap() {
+                    let len = (b.end - b.start) as usize;
+                    let at = (base + b.start) as usize;
+                    let mut raw = bytes[at..at + super::align(len as u64) as usize].to_vec();
+                    for chunk in raw.chunks_mut(16) {
+                        key.decrypt_block(aes::Block::from_mut_slice(chunk));
+                    }
+                    raw.truncate(len);
+                    if fill.is_empty() {
+                        fill = raw[..raw.len().min(16)].to_vec();
+                    }
+                    super::seal(Some(&key), &mut raw, &fill);
+                    out.extend_from_slice(&raw);
+                }
+                assert_eq!(&out[..], &bytes[data_start..data_start + out.len()]);
+                let hash: [u8; 20] = Sha1::digest(&out).into();
+                assert_eq!(hash, header.hash.unwrap().0);
+                checked += 1;
+            }
+        }
+        assert!(checked >= 20, "{checked}");
+    }
+
     #[test]
     fn test_entry() {
         let data = vec![

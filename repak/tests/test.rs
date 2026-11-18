@@ -115,7 +115,9 @@ fn test_read(version: repak::Version, _file_name: &str, bytes: &[u8]) {
     let files: HashSet<String> = HashSet::from_iter(pak.files());
     assert_eq!(
         files,
-        pak.entries().map(|(p, _)| p.to_string()).collect::<HashSet<_>>()
+        pak.entries()
+            .map(|(p, _)| p.to_string())
+            .collect::<HashSet<_>>()
     );
     assert_eq!(
         files,
@@ -131,7 +133,11 @@ fn test_read(version: repak::Version, _file_name: &str, bytes: &[u8]) {
         let mut writer = std::io::Cursor::new(&mut buf);
         pak.read_file(&file, &mut reader, &mut writer).unwrap();
         let info = pak.entry(&file).expect("entry metadata");
-        assert_eq!(info.uncompressed_size, buf.len() as u64, "{file} uncompressed size");
+        assert_eq!(
+            info.uncompressed_size,
+            buf.len() as u64,
+            "{file} uncompressed size"
+        );
         match file.as_str() {
             "test.txt" => assert_eq!(
                 buf,
@@ -177,24 +183,47 @@ fn test_write(_version: repak::Version, _file_name: &str, bytes: &[u8]) {
 
     let mut reader = std::io::Cursor::new(bytes);
     let pak_reader = repak::PakBuilder::new()
-        .key(key)
+        .key(key.clone())
         .reader(&mut reader)
         .unwrap();
 
     let writer = Cursor::new(vec![]);
-    let mut pak_writer = repak::PakBuilder::new().writer(
+    let mut pak_writer = repak::PakBuilder::new().key(key.clone()).writer(
         writer,
         pak_reader.version(),
         pak_reader.mount_point().to_owned(),
-        Some(0x205C5A7D),
+        pak_reader.path_hash_seed().or(Some(0x205C5A7D)),
     );
+    // encryption as in the source pak (UnrealPak-made): the rewrite must be
+    // byte-identical, padding and entry hashes included
+    pak_writer.set_encrypt_entries(pak_reader.entries().any(|(_, e)| e.encrypted));
+    pak_writer.set_encrypt_index(pak_reader.encrypted_index());
+    pak_writer.set_encryption_guid(pak_reader.encryption_guid());
 
     for path in pak_reader.files() {
         let data = pak_reader.get(&path, &mut reader).unwrap();
         pak_writer.write_file(&path, false, data).unwrap();
     }
 
-    assert!(pak_writer.write_index().unwrap().into_inner() == reader.into_inner());
+    let ours = pak_writer.write_index().unwrap().into_inner();
+    let theirs = reader.into_inner();
+    if _file_name.starts_with("pack_v5_") && pak_reader.entries().any(|(_, e)| e.encrypted) {
+        // the UnrealPak that made the v5 packs filled AES padding with
+        // arbitrary bytes (newer ones repeat the data's start, which we do):
+        // same layout, and the contents must read back the same
+        assert_eq!(ours.len(), theirs.len());
+        let mut r = Cursor::new(&ours);
+        let p = repak::PakBuilder::new().key(key).reader(&mut r).unwrap();
+        let mut t = Cursor::new(&theirs);
+        for path in pak_reader.files() {
+            assert_eq!(
+                p.get(&path, &mut r).unwrap(),
+                pak_reader.get(&path, &mut t).unwrap()
+            );
+        }
+        return;
+    }
+    assert!(ours == theirs);
 }
 
 fn test_rewrite_index(_version: repak::Version, _file_name: &str, bytes: &[u8]) {
@@ -285,8 +314,8 @@ matrix_test!(
         "v11" repak::Version::V11,
     ),
     ("", /*"_compress"*/),
-    ("", /*"_encrypt"*/),
-    ("", /*"_encryptindex"*/),
+    ("", "_encrypt"),
+    ("", "_encryptindex"),
     test_write
 );
 
@@ -302,7 +331,7 @@ matrix_test!(
     ),
     ("", "_compress"),
     ("", "_encrypt"),
-    ("", /*"_encryptindex"*/),
+    ("", "_encryptindex"),
     test_rewrite_index
 );
 
@@ -417,7 +446,8 @@ mod roundtrip {
 fn unknown_future_version_is_rejected_not_misparsed() {
     // Write a v12 pak, then patch the footer version to 99.
     let mut buf = std::io::Cursor::new(vec![]);
-    let mut w = repak::PakBuilder::new().writer(&mut buf, repak::Version::V12, "../../../".into(), None);
+    let mut w =
+        repak::PakBuilder::new().writer(&mut buf, repak::Version::V12, "../../../".into(), None);
     w.write_file("a.txt", false, b"hello").unwrap();
     w.write_index().unwrap();
     let mut bytes = buf.into_inner();
@@ -450,7 +480,8 @@ fn wrong_key_is_detected_before_parsing() {
 #[test]
 fn garbage_index_location_is_rejected() {
     let mut buf = std::io::Cursor::new(vec![]);
-    let mut w = repak::PakBuilder::new().writer(&mut buf, repak::Version::V11, "../../../".into(), None);
+    let mut w =
+        repak::PakBuilder::new().writer(&mut buf, repak::Version::V11, "../../../".into(), None);
     w.write_file("a.txt", false, b"hello").unwrap();
     w.write_index().unwrap();
     let mut bytes = buf.into_inner();
@@ -491,7 +522,10 @@ fn block_size_and_uncompressible_fallback() {
     assert_eq!(c.compression, Some(repak::Compression::Zlib));
     assert!(c.compressed_size < c.uncompressed_size);
     let rnd = pak.entry("r.bin").unwrap();
-    assert_eq!(rnd.compression, None, "stored when compression doesn't help");
+    assert_eq!(
+        rnd.compression, None,
+        "stored when compression doesn't help"
+    );
     assert_eq!(pak.get("c.bin", &mut r).unwrap(), compressible);
     assert_eq!(pak.get("r.bin", &mut r).unwrap(), random);
 }
@@ -503,9 +537,15 @@ fn modify_existing_pak_in_place() {
     let mut buf = std::io::Cursor::new(vec![]);
     let mut w = repak::PakBuilder::new()
         .compression([repak::Compression::Zlib])
-        .writer(&mut buf, repak::Version::V11, "../../../Game/Content/".into(), Some(7));
+        .writer(
+            &mut buf,
+            repak::Version::V11,
+            "../../../Game/Content/".into(),
+            Some(7),
+        );
     w.write_file("a.txt", true, b"aaaa".repeat(1000)).unwrap();
-    w.write_file("dir/b.txt", true, b"bbbb".repeat(1000)).unwrap();
+    w.write_file("dir/b.txt", true, b"bbbb".repeat(1000))
+        .unwrap();
     w.write_index().unwrap();
     let original = buf.into_inner();
 
@@ -517,8 +557,12 @@ fn modify_existing_pak_in_place() {
     assert!(w.remove("a.txt"));
     assert!(!w.remove("missing"));
     w.set_compression([repak::Compression::Gzip]);
-    w.set_compression_options(repak::CompressionOptions { gzip_level: 9, ..Default::default() });
-    w.write_file("dir/b.txt", true, b"BBBB".repeat(1000)).unwrap();
+    w.set_compression_options(repak::CompressionOptions {
+        gzip_level: 9,
+        ..Default::default()
+    });
+    w.write_file("dir/b.txt", true, b"BBBB".repeat(1000))
+        .unwrap();
     w.write_file("c.txt", true, b"cccc".repeat(1000)).unwrap();
     w.rename_all(|p| format!("Content/{p}")).unwrap();
     w.set_mount_point("../../../Game/".into());
@@ -528,15 +572,24 @@ fn modify_existing_pak_in_place() {
     out.get_mut().truncate(end as usize);
     out.flush().unwrap();
     let bytes = file.into_inner();
-    assert!(bytes[..index_offset as usize] == original[..index_offset as usize], "old data untouched");
+    assert!(
+        bytes[..index_offset as usize] == original[..index_offset as usize],
+        "old data untouched"
+    );
 
     let mut r = std::io::Cursor::new(&bytes);
     let pak = repak::PakBuilder::new().reader(&mut r).unwrap();
     assert_eq!(pak.mount_point(), "../../../Game/");
     assert_eq!(pak.path_hash_seed(), Some(7), "seed kept");
     assert_eq!(pak.files(), ["Content/c.txt", "Content/dir/b.txt"]);
-    assert_eq!(pak.get("Content/dir/b.txt", &mut r).unwrap(), b"BBBB".repeat(1000));
-    assert_eq!(pak.get("Content/c.txt", &mut r).unwrap(), b"cccc".repeat(1000));
+    assert_eq!(
+        pak.get("Content/dir/b.txt", &mut r).unwrap(),
+        b"BBBB".repeat(1000)
+    );
+    assert_eq!(
+        pak.get("Content/c.txt", &mut r).unwrap(),
+        b"cccc".repeat(1000)
+    );
     let methods = pak.used_compression();
     assert!(methods.contains(&repak::Compression::Gzip));
 
@@ -580,10 +633,24 @@ fn compression_levels_change_output() {
         pak.entry("x").unwrap().compressed_size
     };
     let d = repak::CompressionOptions::default();
-    assert!(size(repak::CompressionOptions { zlib_level: 9, ..d }, repak::Compression::Zlib)
-        <= size(d, repak::Compression::Zlib));
-    assert!(size(repak::CompressionOptions { zstd_level: 19, ..d }, repak::Compression::Zstd)
-        <= size(repak::CompressionOptions { zstd_level: 1, ..d }, repak::Compression::Zstd));
+    assert!(
+        size(
+            repak::CompressionOptions { zlib_level: 9, ..d },
+            repak::Compression::Zlib
+        ) <= size(d, repak::Compression::Zlib)
+    );
+    assert!(
+        size(
+            repak::CompressionOptions {
+                zstd_level: 19,
+                ..d
+            },
+            repak::Compression::Zstd
+        ) <= size(
+            repak::CompressionOptions { zstd_level: 1, ..d },
+            repak::Compression::Zstd
+        )
+    );
 }
 
 #[test]
@@ -602,12 +669,22 @@ fn streaming_write_is_byte_identical() {
         ("empty", vec![]),
         ("one", vec![7]),
         ("block", b"ab".repeat(32768)),
-        ("block_plus_one", b"ab".repeat(32768).into_iter().chain([1]).collect()),
+        (
+            "block_plus_one",
+            b"ab".repeat(32768).into_iter().chain([1]).collect(),
+        ),
         ("multi", b"hello world ".repeat(30_000)),
         ("noise", noise),
     ];
     let versions = [V3, V4, V5, V7, V8A, V8B, V9, V10, V11, V12];
-    let methods: [Option<repak::Compression>; 6] = [None, Some(Zlib), Some(Gzip), Some(Zstd), Some(LZ4), Some(Oodle)];
+    let methods: [Option<repak::Compression>; 6] = [
+        None,
+        Some(Zlib),
+        Some(Gzip),
+        Some(Zstd),
+        Some(LZ4),
+        Some(Oodle),
+    ];
     let mut compared = 0;
     for v in versions {
         for m in methods {
@@ -627,8 +704,14 @@ fn streaming_write_is_byte_identical() {
                 for (name, data) in &payloads {
                     if streaming {
                         let mut src = std::io::Cursor::new(data.clone());
-                        w.write_file_from_reader(name, m.is_some(), &mut src, data.len() as u64, &mut |_| true)
-                            .unwrap();
+                        w.write_file_from_reader(
+                            name,
+                            m.is_some(),
+                            &mut src,
+                            data.len() as u64,
+                            &mut |_| true,
+                        )
+                        .unwrap();
                     } else {
                         w.write_file(name, m.is_some(), data).unwrap();
                     }
@@ -649,7 +732,10 @@ fn streaming_write_is_byte_identical() {
             compared += 1;
         }
     }
-    assert_eq!(compared, 42, "10 versions x 5 methods, minus Zstd/LZ4 before V8A");
+    assert_eq!(
+        compared, 42,
+        "10 versions x 5 methods, minus Zstd/LZ4 before V8A"
+    );
 }
 
 #[test]
@@ -662,16 +748,28 @@ fn streaming_write_cancel_and_progress() {
         .writer(&mut buf, repak::Version::V11, "../../../".into(), None);
     let mut seen = 0u64;
     let mut calls = 0;
-    w.write_file_from_reader("a", true, &mut std::io::Cursor::new(&data), data.len() as u64, &mut |n| {
-        seen += n;
-        calls += 1;
-        true
-    })
+    w.write_file_from_reader(
+        "a",
+        true,
+        &mut std::io::Cursor::new(&data),
+        data.len() as u64,
+        &mut |n| {
+            seen += n;
+            calls += 1;
+            true
+        },
+    )
     .unwrap();
     assert_eq!(seen, data.len() as u64);
     assert_eq!(calls, 5, "one call per 64 KB block");
     let err = w
-        .write_file_from_reader("b", true, &mut std::io::Cursor::new(&data), data.len() as u64, &mut |_| false)
+        .write_file_from_reader(
+            "b",
+            true,
+            &mut std::io::Cursor::new(&data),
+            data.len() as u64,
+            &mut |_| false,
+        )
         .unwrap_err();
     assert!(matches!(err, repak::Error::Cancelled));
 }
@@ -685,12 +783,17 @@ fn verified_read_detects_corruption() {
     w.write_file("raw", false, b"raw data here").unwrap();
     w.write_index().unwrap();
     let mut bytes = buf.into_inner();
-    let pos = bytes.windows(13).position(|w| w == b"raw data here").unwrap();
+    let pos = bytes
+        .windows(13)
+        .position(|w| w == b"raw data here")
+        .unwrap();
     bytes[pos] ^= 1;
     let mut r = std::io::Cursor::new(&bytes);
     let pak = repak::PakBuilder::new().reader(&mut r).unwrap();
     assert!(pak.get("raw", &mut r).is_ok(), "plain read doesn't verify");
-    let err = pak.read_file_verified("raw", &mut r, &mut std::io::sink()).unwrap_err();
+    let err = pak
+        .read_file_verified("raw", &mut r, &mut std::io::sink())
+        .unwrap_err();
     assert!(matches!(err, repak::Error::HashMismatch));
 }
 
@@ -744,8 +847,10 @@ fn streaming_entry_over_4gb() {
     }
     let size = 4_300_000_000u64;
     let mut sink = Sink(vec![0; 65536], 0, 0);
-    let mut w = repak::PakBuilder::new().writer(&mut sink, repak::Version::V11, "../../../".into(), None);
-    w.write_file_from_reader("big.bin", false, &mut Zeros(0, size), size, &mut |_| true).unwrap();
+    let mut w =
+        repak::PakBuilder::new().writer(&mut sink, repak::Version::V11, "../../../".into(), None);
+    w.write_file_from_reader("big.bin", false, &mut Zeros(0, size), size, &mut |_| true)
+        .unwrap();
     w.write_index().unwrap();
     // in-data record: offset(0), compressed, uncompressed as u64
     let compressed = u64::from_le_bytes(sink.0[8..16].try_into().unwrap());
@@ -777,7 +882,11 @@ fn data_end_and_write_at_reuse_tail() {
         let a = pak.entry("a").unwrap();
         let bb = pak.entry("b").unwrap();
         assert_eq!(a.data_end, bb.offset, "{v} {comp:?}: a ends where b starts");
-        assert_eq!(bb.data_end, pak.index_offset().unwrap(), "{v} {comp:?}: b ends at the index");
+        assert_eq!(
+            bb.data_end,
+            pak.index_offset().unwrap(),
+            "{v} {comp:?}: b ends at the index"
+        );
         // replace b reusing its space: write at b.offset
         let mut file = std::io::Cursor::new(bytes.clone());
         let pak = repak::PakBuilder::new().reader(&mut file).unwrap();
@@ -792,7 +901,11 @@ fn data_end_and_write_at_reuse_tail() {
         let end = out.stream_position().unwrap();
         out.get_mut().truncate(end as usize);
         let new = file.into_inner();
-        assert_eq!(new.len(), bytes.len(), "{v} {comp:?}: no growth when replacing the last entry");
+        assert_eq!(
+            new.len(),
+            bytes.len(),
+            "{v} {comp:?}: no growth when replacing the last entry"
+        );
         let mut r = std::io::Cursor::new(&new);
         let pak = repak::PakBuilder::new().reader(&mut r).unwrap();
         assert_eq!(pak.get("b", &mut r).unwrap(), b"BBBB".repeat(5000));
@@ -801,7 +914,10 @@ fn data_end_and_write_at_reuse_tail() {
     // encrypted test pak: data_end accounts for AES padding
     let bytes = include_bytes!("packs/pack_v8b_compress_encrypt.pak");
     use aes::cipher::KeyInit;
-    let key = aes::Aes256::new_from_slice(&base64::Engine::decode(&base64::engine::general_purpose::STANDARD, AES_KEY).unwrap()).unwrap();
+    let key = aes::Aes256::new_from_slice(
+        &base64::Engine::decode(&base64::engine::general_purpose::STANDARD, AES_KEY).unwrap(),
+    )
+    .unwrap();
     let mut r = std::io::Cursor::new(&bytes[..]);
     let pak = repak::PakBuilder::new().key(key).reader(&mut r).unwrap();
     let mut spans: Vec<(u64, u64)> = pak.entries().map(|(_, e)| (e.offset, e.data_end)).collect();
@@ -812,3 +928,214 @@ fn data_end_and_write_at_reuse_tail() {
     assert!(spans.last().unwrap().1 <= pak.index_offset().unwrap());
 }
 
+#[test]
+fn encrypted_write_roundtrip() {
+    use aes::cipher::KeyInit;
+    use repak::{Compression::*, Version::*};
+    let key = aes::Aes256::new_from_slice(&[0x5a; 32]).unwrap();
+    let wrong = aes::Aes256::new_from_slice(&[0x11; 32]).unwrap();
+    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+    let noise: Vec<u8> = (0..70_001)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 32) as u8
+        })
+        .collect();
+    let payloads: Vec<(&str, Vec<u8>)> = vec![
+        ("a/empty", vec![]),
+        ("a/one", vec![7]),
+        ("a/fifteen", vec![3; 15]),
+        ("a/sixteen", vec![4; 16]),
+        ("b/text", b"hello world ".repeat(30_000)),
+        ("b/noise", noise),
+        ("c/big", b"0123456789abcdef!".repeat(80_000)), // > 1 MiB stored chunk
+    ];
+    let mut checked = 0;
+    for v in [V4, V5, V7, V8A, V8B, V9, V10, V11, V12] {
+        for m in [None, Some(Zlib), Some(Gzip), Some(Zstd), Some(LZ4)] {
+            if v < V8A && matches!(m, Some(Zstd) | Some(LZ4)) {
+                continue;
+            }
+            for streaming in [false, true] {
+                let mut b = repak::PakBuilder::new()
+                    .key(key.clone())
+                    .compression_block_size(65536);
+                if let Some(m) = m {
+                    b = b.compression([m]);
+                }
+                let mut w = b.writer(Cursor::new(vec![]), v, "../../../G/".into(), Some(0x1234));
+                w.set_encrypt_entries(true);
+                w.set_encrypt_index(true);
+                let guid = (v >= V7).then_some(0x0102_0304_0506_0708_090a_0b0c_0d0e_0f10u128);
+                w.set_encryption_guid(guid);
+                for (name, data) in &payloads {
+                    if streaming {
+                        let mut src = Cursor::new(data.clone());
+                        w.write_file_from_reader(
+                            name,
+                            m.is_some(),
+                            &mut src,
+                            data.len() as u64,
+                            &mut |_| true,
+                        )
+                        .unwrap();
+                    } else {
+                        w.write_file(name, m.is_some(), data).unwrap();
+                    }
+                }
+                let bytes = w.write_index().unwrap().into_inner();
+                let what = format!("{v:?} {m:?} streaming={streaming}");
+                // no key / wrong key
+                assert!(
+                    matches!(
+                        repak::PakBuilder::new().reader(&mut Cursor::new(&bytes)),
+                        Err(repak::Error::Encrypted)
+                    ),
+                    "{what}"
+                );
+                assert!(
+                    matches!(
+                        repak::PakBuilder::new()
+                            .key(wrong.clone())
+                            .reader(&mut Cursor::new(&bytes)),
+                        Err(repak::Error::WrongKey)
+                    ),
+                    "{what}"
+                );
+                let mut r = Cursor::new(&bytes);
+                let pak = repak::PakBuilder::new()
+                    .key(key.clone())
+                    .reader(&mut r)
+                    .unwrap();
+                assert!(pak.encrypted_index(), "{what}");
+                if v >= V7 {
+                    assert_eq!(pak.encryption_guid(), guid, "{what}");
+                }
+                for (name, data) in &payloads {
+                    let info = pak.entries().find(|(p, _)| p == name).unwrap().1;
+                    assert_eq!(info.encrypted, !data.is_empty(), "{what} {name}");
+                    let mut out = vec![];
+                    pak.read_file_verified(name, &mut r, &mut out)
+                        .unwrap_or_else(|e| panic!("{what} {name}: {e}"));
+                    assert_eq!(&out, data, "{what} {name}");
+                }
+                // entries don't overlap and end before the index
+                let mut spans: Vec<(u64, u64)> =
+                    pak.entries().map(|(_, e)| (e.offset, e.data_end)).collect();
+                spans.sort();
+                for p in spans.windows(2) {
+                    assert!(p[0].1 <= p[1].0, "{what}: {spans:?}");
+                }
+                assert!(
+                    spans.last().unwrap().1 <= pak.index_offset().unwrap(),
+                    "{what}"
+                );
+                checked += 1;
+            }
+        }
+    }
+    assert_eq!(checked, 78);
+}
+
+#[test]
+fn encrypted_append_keeps_index_encryption() {
+    use aes::cipher::KeyInit;
+    let key = aes::Aes256::new_from_slice(
+        &base64::Engine::decode(&base64::engine::general_purpose::STANDARD, AES_KEY).unwrap(),
+    )
+    .unwrap();
+    for bytes in [
+        &include_bytes!("packs/pack_v11_compress_encrypt_encryptindex.pak")[..],
+        &include_bytes!("packs/pack_v8b_encrypt_encryptindex.pak")[..],
+        &include_bytes!("packs/pack_v11_encryptindex.pak")[..],
+    ] {
+        let mut buf = Cursor::new(bytes.to_vec());
+        let pak = repak::PakBuilder::new()
+            .key(key.clone())
+            .reader(&mut buf)
+            .unwrap();
+        let encrypt_entries = pak.entries().any(|(_, e)| e.encrypted);
+        let at = pak.index_offset().unwrap();
+        let old: Vec<String> = pak.files();
+        let mut w = pak.into_pakwriter_at(buf, at).unwrap();
+        w.set_compression([repak::Compression::Zlib]);
+        w.set_encrypt_entries(encrypt_entries);
+        w.write_file("new/added.txt", true, b"added ".repeat(5000))
+            .unwrap();
+        let mut out = w.write_index().unwrap();
+        let end = out.stream_position().unwrap();
+        out.get_mut().truncate(end as usize);
+        let new = out.into_inner();
+        assert!(matches!(
+            repak::PakBuilder::new().reader(&mut Cursor::new(&new)),
+            Err(repak::Error::Encrypted)
+        ));
+        let mut r = Cursor::new(&new);
+        let p = repak::PakBuilder::new()
+            .key(key.clone())
+            .reader(&mut r)
+            .unwrap();
+        assert!(p.encrypted_index());
+        let added = p.entries().find(|(n, _)| *n == "new/added.txt").unwrap().1;
+        assert_eq!(added.encrypted, encrypt_entries);
+        let mut data = vec![];
+        p.read_file_verified("new/added.txt", &mut r, &mut data)
+            .unwrap();
+        assert_eq!(data, b"added ".repeat(5000));
+        for f in old {
+            p.read_file_verified(&f, &mut r, &mut std::io::sink())
+                .unwrap();
+        }
+    }
+}
+
+/// With `UEPAK_KEYED_PAK` / `UEPAK_KEYED_KEY` (a real encrypted pak and its
+/// key, kept out of the repo): rewriting its index keeps it readable with
+/// the same key, same entries and same footer. (Not byte-identical: UE
+/// writes the full directory index in hash-map order; same contents.)
+#[test]
+fn real_encrypted_pak_index_rewrite_reads_back() {
+    let (Ok(path), Ok(hex)) = (
+        std::env::var("UEPAK_KEYED_PAK"),
+        std::env::var("UEPAK_KEYED_KEY"),
+    ) else {
+        return;
+    };
+    use aes::cipher::KeyInit;
+    let hex = hex.trim_start_matches("0x");
+    let raw: Vec<u8> = (0..32)
+        .map(|i| u8::from_str_radix(&hex[i * 2..i * 2 + 2], 16).unwrap())
+        .collect();
+    let key = aes::Aes256::new_from_slice(&raw).unwrap();
+    let bytes = std::fs::read(path).unwrap();
+    let mut buf = Cursor::new(bytes.clone());
+    let pak = repak::PakBuilder::new()
+        .key(key.clone())
+        .reader(&mut buf)
+        .unwrap();
+    assert!(pak.encrypted_index());
+    let before: Vec<_> = pak.entries().map(|(p, e)| (p.to_string(), e)).collect();
+    let (guid, at) = (pak.encryption_guid(), pak.index_offset().unwrap());
+    let out = pak
+        .into_pakwriter_at(buf, at)
+        .unwrap()
+        .write_index()
+        .unwrap()
+        .into_inner();
+    assert_eq!(out.len(), bytes.len());
+    assert_eq!(out[..at as usize], bytes[..at as usize]);
+    // v11 footer: GUID 16, encrypted 1, magic 4, version 4, offset 8, size 8,
+    // hash 20 (differs with the directory order), compression names 160
+    let foot = |b: &[u8]| {
+        let f = &b[b.len() - 221..];
+        [&f[..41], &f[61..]].concat()
+    };
+    assert_eq!(foot(&out), foot(&bytes), "footer except the index hash");
+    let mut r = Cursor::new(&out);
+    let p = repak::PakBuilder::new().key(key).reader(&mut r).unwrap();
+    assert_eq!(p.encryption_guid(), guid);
+    let after: Vec<_> = p.entries().map(|(p, e)| (p.to_string(), e)).collect();
+    assert_eq!(before, after);
+}
