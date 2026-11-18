@@ -79,6 +79,12 @@ pub enum Error {
     #[error("AES key does not match this pak")]
     WrongKey,
 
+    #[error("entry data does not match its SHA-1 hash")]
+    HashMismatch,
+
+    #[error("cancelled")]
+    Cancelled,
+
     #[error("invalid index: {0}")]
     InvalidIndex(String),
 

@@ -104,6 +104,27 @@ pub struct EntryInfo {
     pub encrypted: bool,
     /// Raw timestamp, only present in very old pak versions.
     pub timestamp: Option<u64>,
+    /// End of the entry in the file (its record + stored data, incl. AES
+    /// padding): the first byte after it.
+    pub data_end: u64,
+}
+
+fn entry_data_end(entry: &super::entry::Entry, version: super::Version) -> u64 {
+    let align = |v: u64| (v + 15) & !15;
+    let blocks = entry.blocks.as_ref().map_or(0, |b| b.len() as u32);
+    let header = super::entry::Entry::get_serialized_size(version, entry.compression_slot, blocks);
+    let stored = if entry.is_encrypted() { align(entry.compressed) } else { entry.compressed };
+    let mut end = entry.offset + header + stored;
+    if let Some(last) = entry.blocks.as_ref().and_then(|b| b.last()) {
+        let abs = if version.version_major() >= super::VersionMajor::RelativeChunkOffsets {
+            entry.offset + last.end
+        } else {
+            last.end
+        };
+        let abs = if entry.is_encrypted() { entry.offset + header + align(abs - entry.offset - header) } else { abs };
+        end = end.max(abs);
+    }
+    end
 }
 
 #[derive(Debug)]
@@ -282,6 +303,28 @@ impl PakReader {
                 &self.pak.compression,
                 &self.key,
                 writer,
+                false,
+            ),
+            None => Err(super::Error::MissingEntry(path.to_owned())),
+        }
+    }
+
+    /// Like [`read_file`](Self::read_file), and also checks the SHA-1 of the
+    /// stored data against the entry's hash (`Error::HashMismatch`).
+    pub fn read_file_verified<R: Read + Seek, W: Write>(
+        &self,
+        path: &str,
+        reader: &mut R,
+        writer: &mut W,
+    ) -> Result<(), super::Error> {
+        match self.pak.index.entries().get(path) {
+            Some(entry) => entry.read_file(
+                reader,
+                self.pak.version,
+                &self.pak.compression,
+                &self.key,
+                writer,
+                true,
             ),
             None => Err(super::Error::MissingEntry(path.to_owned())),
         }
@@ -319,6 +362,7 @@ impl PakReader {
                 .and_then(|slot| self.pak.compression.get(slot as usize).copied().flatten()),
             encrypted: entry.is_encrypted(),
             timestamp: entry.timestamp,
+            data_end: entry_data_end(entry, self.pak.version),
         }
     }
 
@@ -341,9 +385,28 @@ impl PakReader {
 
     pub fn into_pakwriter<W: Write + Seek>(
         self,
-        mut writer: W,
+        writer: W,
     ) -> Result<PakWriter<W>, super::Error> {
-        writer.seek(io::SeekFrom::Start(self.pak.index_offset.unwrap()))?;
+        let at = self.pak.index_offset.unwrap();
+        self.into_pakwriter_at(writer, at)
+    }
+
+    /// Like [`into_pakwriter`](Self::into_pakwriter), but new data starts at
+    /// `offset` (≤ the index offset). Callers use this to reuse space at the
+    /// end of the data area that no remaining entry occupies; entries that
+    /// lie at or after `offset` must have been removed before writing.
+    pub fn into_pakwriter_at<W: Write + Seek>(
+        self,
+        mut writer: W,
+        offset: u64,
+    ) -> Result<PakWriter<W>, super::Error> {
+        let index_offset = self.pak.index_offset.unwrap();
+        if offset > index_offset {
+            return Err(super::Error::Other(format!(
+                "write offset {offset} lies after the index ({index_offset})"
+            )));
+        }
+        writer.seek(io::SeekFrom::Start(offset))?;
         Ok(PakWriter {
             allowed_compression: self.pak.compression.iter().filter_map(|c| *c).collect(),
             compression_block_size: crate::data::DEFAULT_COMPRESSION_BLOCK_SIZE,
@@ -488,6 +551,35 @@ impl<W: Write + Seek> PakWriter<W> {
 
         Ok(())
     }
+    /// Streams a file into the pak block by block (constant memory), with
+    /// progress/cancel. Byte-identical to [`write_file`](Self::write_file).
+    pub fn write_file_from_reader<R: Read + Seek>(
+        &mut self,
+        path: &str,
+        allow_compress: bool,
+        source: &mut R,
+        size: u64,
+        progress: &mut dyn FnMut(u64) -> bool,
+    ) -> Result<(), super::Error> {
+        let entry = Entry::write_file_from_reader(
+            &mut self.writer,
+            self.pak.version,
+            &mut self.pak.compression,
+            if allow_compress {
+                &self.allowed_compression
+            } else {
+                &[]
+            },
+            self.compression_block_size,
+            &self.compression_options,
+            source,
+            size,
+            progress,
+        )?;
+        self.pak.index.add_entry(path.to_string(), entry);
+        Ok(())
+    }
+
     pub fn write_index(mut self) -> Result<W, super::Error> {
         self.pak.write(&mut self.writer, &self.key)?;
         Ok(self.writer)

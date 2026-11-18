@@ -25,7 +25,7 @@ pub(crate) enum PartialEntryData<D> {
 }
 
 #[cfg(feature = "compression")]
-fn get_compression_slot(
+pub(crate) fn get_compression_slot(
     version: Version,
     compression_slots: &mut Vec<Option<Compression>>,
     compression: Compression,
@@ -243,7 +243,7 @@ where
 }
 
 #[cfg(feature = "compression")]
-fn compress(compression: Compression, options: &CompressionOptions, data: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn compress(compression: Compression, options: &CompressionOptions, data: &[u8]) -> Result<Vec<u8>> {
     use std::io::Write;
 
     let compressed = match compression {

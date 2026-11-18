@@ -585,3 +585,230 @@ fn compression_levels_change_output() {
     assert!(size(repak::CompressionOptions { zstd_level: 19, ..d }, repak::Compression::Zstd)
         <= size(repak::CompressionOptions { zstd_level: 1, ..d }, repak::Compression::Zstd));
 }
+
+#[test]
+fn streaming_write_is_byte_identical() {
+    use repak::{Compression::*, Version::*};
+    let mut x: u64 = 0x1234_5678_9abc_def1;
+    let noise: Vec<u8> = (0..70_000)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            (x >> 32) as u8
+        })
+        .collect();
+    let payloads: Vec<(&str, Vec<u8>)> = vec![
+        ("empty", vec![]),
+        ("one", vec![7]),
+        ("block", b"ab".repeat(32768)),
+        ("block_plus_one", b"ab".repeat(32768).into_iter().chain([1]).collect()),
+        ("multi", b"hello world ".repeat(30_000)),
+        ("noise", noise),
+    ];
+    let versions = [V3, V4, V5, V7, V8A, V8B, V9, V10, V11, V12];
+    let methods: [Option<repak::Compression>; 6] = [None, Some(Zlib), Some(Gzip), Some(Zstd), Some(LZ4), Some(Oodle)];
+    let mut compared = 0;
+    for v in versions {
+        for m in methods {
+            if m == Some(Oodle) {
+                continue; // needs the library
+            }
+            if v < V8A && matches!(m, Some(Zstd) | Some(LZ4)) {
+                continue;
+            }
+            let build = |streaming: bool| {
+                let mut buf = std::io::Cursor::new(vec![]);
+                let mut b = repak::PakBuilder::new().compression_block_size(65536);
+                if let Some(m) = m {
+                    b = b.compression([m]);
+                }
+                let mut w = b.writer(&mut buf, v, "../../../G/".into(), None);
+                for (name, data) in &payloads {
+                    if streaming {
+                        let mut src = std::io::Cursor::new(data.clone());
+                        w.write_file_from_reader(name, m.is_some(), &mut src, data.len() as u64, &mut |_| true)
+                            .unwrap();
+                    } else {
+                        w.write_file(name, m.is_some(), data).unwrap();
+                    }
+                }
+                w.write_index().unwrap();
+                buf.into_inner()
+            };
+            let (a, b) = (build(false), build(true));
+            assert!(a == b, "{v} {m:?}: streaming output differs");
+            // and it reads back, also with hash verification
+            let mut r = std::io::Cursor::new(&b);
+            let pak = repak::PakBuilder::new().reader(&mut r).unwrap();
+            for (name, data) in &payloads {
+                let mut out = vec![];
+                pak.read_file_verified(name, &mut r, &mut out).unwrap();
+                assert_eq!(&out, data, "{v} {m:?} {name}");
+            }
+            compared += 1;
+        }
+    }
+    assert_eq!(compared, 42, "10 versions x 5 methods, minus Zstd/LZ4 before V8A");
+}
+
+#[test]
+fn streaming_write_cancel_and_progress() {
+    let data = b"xyz".repeat(100_000);
+    let mut buf = std::io::Cursor::new(vec![]);
+    let mut w = repak::PakBuilder::new()
+        .compression([repak::Compression::Zlib])
+        .compression_block_size(65536)
+        .writer(&mut buf, repak::Version::V11, "../../../".into(), None);
+    let mut seen = 0u64;
+    let mut calls = 0;
+    w.write_file_from_reader("a", true, &mut std::io::Cursor::new(&data), data.len() as u64, &mut |n| {
+        seen += n;
+        calls += 1;
+        true
+    })
+    .unwrap();
+    assert_eq!(seen, data.len() as u64);
+    assert_eq!(calls, 5, "one call per 64 KB block");
+    let err = w
+        .write_file_from_reader("b", true, &mut std::io::Cursor::new(&data), data.len() as u64, &mut |_| false)
+        .unwrap_err();
+    assert!(matches!(err, repak::Error::Cancelled));
+}
+
+#[test]
+fn verified_read_detects_corruption() {
+    let mut buf = std::io::Cursor::new(vec![]);
+    let mut w = repak::PakBuilder::new()
+        .compression([repak::Compression::Zlib])
+        .writer(&mut buf, repak::Version::V11, "../../../".into(), None);
+    w.write_file("raw", false, b"raw data here").unwrap();
+    w.write_index().unwrap();
+    let mut bytes = buf.into_inner();
+    let pos = bytes.windows(13).position(|w| w == b"raw data here").unwrap();
+    bytes[pos] ^= 1;
+    let mut r = std::io::Cursor::new(&bytes);
+    let pak = repak::PakBuilder::new().reader(&mut r).unwrap();
+    assert!(pak.get("raw", &mut r).is_ok(), "plain read doesn't verify");
+    let err = pak.read_file_verified("raw", &mut r, &mut std::io::sink()).unwrap_err();
+    assert!(matches!(err, repak::Error::HashMismatch));
+}
+
+/// A >4 GB entry through the streaming writer, without the data in memory.
+#[test]
+fn streaming_entry_over_4gb() {
+    struct Zeros(u64, u64); // (pos, len)
+    impl std::io::Read for Zeros {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = (buf.len() as u64).min(self.1 - self.0) as usize;
+            buf[..n].fill(0);
+            self.0 += n as u64;
+            Ok(n)
+        }
+    }
+    impl std::io::Seek for Zeros {
+        fn seek(&mut self, p: std::io::SeekFrom) -> std::io::Result<u64> {
+            if let std::io::SeekFrom::Start(s) = p {
+                self.0 = s;
+            }
+            Ok(self.0)
+        }
+    }
+    /// Discards data, keeps the first 64 KB (headers) and tracks position.
+    struct Sink(Vec<u8>, u64, u64);
+    impl std::io::Write for Sink {
+        fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+            for (i, byte) in b.iter().enumerate() {
+                let at = self.1 + i as u64;
+                if at < self.0.len() as u64 {
+                    self.0[at as usize] = *byte;
+                }
+            }
+            self.1 += b.len() as u64;
+            self.2 = self.2.max(self.1);
+            Ok(b.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl std::io::Seek for Sink {
+        fn seek(&mut self, p: std::io::SeekFrom) -> std::io::Result<u64> {
+            match p {
+                std::io::SeekFrom::Start(s) => self.1 = s,
+                std::io::SeekFrom::End(e) => self.1 = (self.2 as i64 + e) as u64,
+                std::io::SeekFrom::Current(c) => self.1 = (self.1 as i64 + c) as u64,
+            }
+            Ok(self.1)
+        }
+    }
+    let size = 4_300_000_000u64;
+    let mut sink = Sink(vec![0; 65536], 0, 0);
+    let mut w = repak::PakBuilder::new().writer(&mut sink, repak::Version::V11, "../../../".into(), None);
+    w.write_file_from_reader("big.bin", false, &mut Zeros(0, size), size, &mut |_| true).unwrap();
+    w.write_index().unwrap();
+    // in-data record: offset(0), compressed, uncompressed as u64
+    let compressed = u64::from_le_bytes(sink.0[8..16].try_into().unwrap());
+    let uncompressed = u64::from_le_bytes(sink.0[16..24].try_into().unwrap());
+    assert_eq!((compressed, uncompressed), (size, size));
+    assert!(sink.2 > size);
+}
+
+#[test]
+fn data_end_and_write_at_reuse_tail() {
+    for (v, comp) in [
+        (repak::Version::V11, Some(repak::Compression::Zlib)),
+        (repak::Version::V11, None),
+        (repak::Version::V4, Some(repak::Compression::Zlib)),
+        (repak::Version::V3, None),
+    ] {
+        let mut buf = std::io::Cursor::new(vec![]);
+        let mut b = repak::PakBuilder::new();
+        if let Some(c) = comp {
+            b = b.compression([c]);
+        }
+        let mut w = b.writer(&mut buf, v, "../../../".into(), None);
+        w.write_file("a", true, b"aaaa".repeat(5000)).unwrap();
+        w.write_file("b", true, b"bbbb".repeat(5000)).unwrap();
+        w.write_index().unwrap();
+        let bytes = buf.into_inner();
+        let mut r = std::io::Cursor::new(&bytes);
+        let pak = repak::PakBuilder::new().reader(&mut r).unwrap();
+        let a = pak.entry("a").unwrap();
+        let bb = pak.entry("b").unwrap();
+        assert_eq!(a.data_end, bb.offset, "{v} {comp:?}: a ends where b starts");
+        assert_eq!(bb.data_end, pak.index_offset().unwrap(), "{v} {comp:?}: b ends at the index");
+        // replace b reusing its space: write at b.offset
+        let mut file = std::io::Cursor::new(bytes.clone());
+        let pak = repak::PakBuilder::new().reader(&mut file).unwrap();
+        let at = pak.entry("b").unwrap().offset;
+        let mut w = pak.into_pakwriter_at(&mut file, at).unwrap();
+        w.remove("b");
+        // a reopened writer defaults to the pak's slots (pre-v8: Zlib first)
+        w.set_compression(comp);
+        w.write_file("b", true, b"BBBB".repeat(5000)).unwrap();
+        let out = w.write_index().unwrap();
+        use std::io::Seek;
+        let end = out.stream_position().unwrap();
+        out.get_mut().truncate(end as usize);
+        let new = file.into_inner();
+        assert_eq!(new.len(), bytes.len(), "{v} {comp:?}: no growth when replacing the last entry");
+        let mut r = std::io::Cursor::new(&new);
+        let pak = repak::PakBuilder::new().reader(&mut r).unwrap();
+        assert_eq!(pak.get("b", &mut r).unwrap(), b"BBBB".repeat(5000));
+        assert_eq!(pak.get("a", &mut r).unwrap(), b"aaaa".repeat(5000));
+    }
+    // encrypted test pak: data_end accounts for AES padding
+    let bytes = include_bytes!("packs/pack_v8b_compress_encrypt.pak");
+    use aes::cipher::KeyInit;
+    let key = aes::Aes256::new_from_slice(&base64::Engine::decode(&base64::engine::general_purpose::STANDARD, AES_KEY).unwrap()).unwrap();
+    let mut r = std::io::Cursor::new(&bytes[..]);
+    let pak = repak::PakBuilder::new().key(key).reader(&mut r).unwrap();
+    let mut spans: Vec<(u64, u64)> = pak.entries().map(|(_, e)| (e.offset, e.data_end)).collect();
+    spans.sort();
+    for w in spans.windows(2) {
+        assert!(w[0].1 <= w[1].0, "entries don't overlap: {spans:?}");
+    }
+    assert!(spans.last().unwrap().1 <= pak.index_offset().unwrap());
+}
+

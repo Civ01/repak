@@ -116,6 +116,120 @@ impl Entry {
         Ok(entry)
     }
 
+    /// Streams `size` bytes from `source` into a new entry at the writer's
+    /// position, one compression block at a time. Output is byte-identical
+    /// to [`Entry::write_file`] for the same data. `progress(bytes)` is called
+    /// as data is consumed; returning `false` aborts with `Error::Cancelled`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn write_file_from_reader<W: io::Write + io::Seek, R: io::Read + io::Seek>(
+        writer: &mut W,
+        version: Version,
+        compression_slots: &mut Vec<Option<Compression>>,
+        allowed_compression: &[Compression],
+        compression_block_size: u32,
+        options: &crate::CompressionOptions,
+        source: &mut R,
+        size: u64,
+        progress: &mut dyn FnMut(u64) -> bool,
+    ) -> Result<Self, Error> {
+        use sha1::{Digest, Sha1};
+        let start = writer.stream_position()?;
+        let source_start = source.stream_position()?;
+        let compression = if size == 0 { None } else { allowed_compression.first().copied() };
+
+        #[cfg(feature = "compression")]
+        if let Some(comp) = compression {
+            let block_size = compression_block_size.max(1) as u64;
+            let n_blocks = size.div_ceil(block_size);
+            // allocate the slot on a copy: committed only if compression is kept
+            let mut slots = compression_slots.clone();
+            let slot = crate::data::get_compression_slot(version, &mut slots, comp)?;
+            let header = Entry::get_serialized_size(version, Some(slot), n_blocks as u32);
+            writer.seek(io::SeekFrom::Start(start + header))?;
+            let mut hasher = Sha1::new();
+            let mut blocks = Vec::with_capacity(n_blocks.min(1 << 20) as usize);
+            let mut offset = header;
+            if version.version_major() < VersionMajor::RelativeChunkOffsets {
+                offset += start;
+            }
+            let mut compressed_size = 0;
+            let mut chunk = vec![0u8; block_size.min(size) as usize];
+            let mut left = size;
+            while left > 0 {
+                let n = left.min(block_size) as usize;
+                source.read_exact(&mut chunk[..n])?;
+                let data = crate::data::compress(comp, options, &chunk[..n])?;
+                writer.write_all(&data)?;
+                hasher.update(&data);
+                blocks.push(Block {
+                    start: offset,
+                    end: offset + data.len() as u64,
+                });
+                offset += data.len() as u64;
+                compressed_size += data.len() as u64;
+                left -= n as u64;
+                if !progress(n as u64) {
+                    return Err(Error::Cancelled);
+                }
+            }
+            if compressed_size < size {
+                *compression_slots = slots;
+                let entry = Entry {
+                    offset: start,
+                    compressed: compressed_size,
+                    uncompressed: size,
+                    compression_slot: Some(slot),
+                    timestamp: None,
+                    hash: Some(Hash(hasher.finalize().into())),
+                    blocks: Some(blocks),
+                    flags: 0,
+                    compression_block_size: block_size as u32,
+                };
+                writer.seek(io::SeekFrom::Start(start))?;
+                entry.write(writer, version, EntryLocation::Data)?;
+                writer.seek(io::SeekFrom::Start(start + header + compressed_size))?;
+                return Ok(entry);
+            }
+            // didn't shrink: store it raw (second pass over the source)
+            source.seek(io::SeekFrom::Start(source_start))?;
+        }
+        #[cfg(not(feature = "compression"))]
+        let _ = (compression, compression_block_size, options);
+
+        let header = Entry::get_serialized_size(version, None, 0);
+        writer.seek(io::SeekFrom::Start(start + header))?;
+        let mut hasher = Sha1::new();
+        let mut chunk = vec![0u8; (1u64 << 20).min(size.max(1)) as usize];
+        let mut left = size;
+        let reported = compression.is_some();
+        while left > 0 {
+            let n = left.min(chunk.len() as u64) as usize;
+            source.read_exact(&mut chunk[..n])?;
+            writer.write_all(&chunk[..n])?;
+            hasher.update(&chunk[..n]);
+            left -= n as u64;
+            // a raw second pass only checks for Cancel (bytes already reported)
+            if !progress(if reported { 0 } else { n as u64 }) {
+                return Err(Error::Cancelled);
+            }
+        }
+        let entry = Entry {
+            offset: start,
+            compressed: size,
+            uncompressed: size,
+            compression_slot: None,
+            timestamp: None,
+            hash: Some(Hash(hasher.finalize().into())),
+            blocks: None,
+            flags: 0,
+            compression_block_size: 0,
+        };
+        writer.seek(io::SeekFrom::Start(start))?;
+        entry.write(writer, version, EntryLocation::Data)?;
+        writer.seek(io::SeekFrom::Start(start + header + size))?;
+        Ok(entry)
+    }
+
     pub fn read<R: io::Read>(
         reader: &mut R,
         version: super::Version,
@@ -336,6 +450,15 @@ impl Entry {
         Ok(())
     }
 
+    /// Streams an entry to `buf` block by block: memory use is one
+    /// compression block (or 1 MiB for stored entries), whatever the entry
+    /// size. With `verify`, the entry's SHA-1 (from the record stored before
+    /// the data; v10+ index entries carry none) is checked
+    /// (`Error::HashMismatch`). Verified against real Unreal paks: the hash
+    /// covers the stored bytes; for encrypted compressed entries, the
+    /// encrypted bytes including AES padding. Encrypted uncompressed entries
+    /// are not checked (no reliable rule found).
+    #[allow(clippy::too_many_arguments)]
     pub fn read_file<R: io::Read + io::Seek, W: io::Write>(
         &self,
         reader: &mut R,
@@ -343,110 +466,143 @@ impl Entry {
         compression: &[Option<Compression>],
         #[allow(unused)] key: &super::Key,
         buf: &mut W,
+        verify: bool,
     ) -> Result<(), super::Error> {
+        use sha1::{Digest, Sha1};
         reader.seek(io::SeekFrom::Start(self.offset))?;
-        Entry::read(reader, version)?;
-        #[cfg(any(feature = "compression", feature = "oodle_core"))]
+        let header = Entry::read(reader, version)?;
         let data_offset = reader.stream_position()?;
-        #[allow(unused_mut)]
-        let mut data = reader.read_len(match self.is_encrypted() {
+        let encrypted = self.is_encrypted();
+        let expected = header.hash.or(self.hash);
+        #[cfg(feature = "encryption")]
+        let cipher = match (encrypted, key) {
+            (false, _) => None,
+            (true, super::Key::Some(k)) => Some(k),
+            (true, _) => return Err(super::Error::Encrypted),
+        };
+        #[cfg(not(feature = "encryption"))]
+        if encrypted {
+            return Err(super::Error::Encryption);
+        }
+        let stored_len = match encrypted {
             true => align(self.compressed),
             false => self.compressed,
-        } as usize)?;
-        if self.is_encrypted() {
-            #[cfg(not(feature = "encryption"))]
-            return Err(super::Error::Encryption);
+        };
+        let compressed_entry = self.compression_slot.is_some();
+        // unencrypted: hash the bytes as read; encrypted+compressed: a
+        // separate pass over the raw (encrypted) bytes below
+        let mut hasher = (verify && !encrypted).then(Sha1::new);
+
+        // Reads stored bytes [lo, hi) (relative to the data start), decrypting
+        // whole AES blocks around the range (ECB: blocks are independent).
+        {
+        let mut span = |reader: &mut R, lo: u64, hi: u64| -> Result<Vec<u8>, super::Error> {
+            let (lo16, hi16) = match encrypted {
+                true => (lo & !15, align(hi).min(stored_len)),
+                false => (lo, hi),
+            };
+            reader.seek(io::SeekFrom::Start(data_offset + lo16))?;
+            #[allow(unused_mut)]
+            let mut data = reader.read_len((hi16 - lo16) as usize)?;
             #[cfg(feature = "encryption")]
-            {
-                let super::Key::Some(key) = key else {
-                    return Err(super::Error::Encrypted);
-                };
+            if let Some(key) = cipher {
                 use aes::cipher::BlockDecrypt;
                 for block in data.chunks_mut(16) {
                     key.decrypt_block(aes::Block::from_mut_slice(block))
                 }
-                data.truncate(self.compressed as usize);
             }
-        }
-
-        #[cfg(feature = "compression")]
-        let ranges = {
-            let offset = |index: u64| -> usize {
-                (match version.version_major() >= VersionMajor::RelativeChunkOffsets {
-                    true => index - (data_offset - self.offset),
-                    false => index - data_offset,
-                }) as usize
-            };
-
-            match &self.blocks {
-                Some(blocks) => blocks
-                    .iter()
-                    .map(|block| offset(block.start)..offset(block.end))
-                    .collect::<Vec<_>>(),
-                #[allow(clippy::single_range_in_vec_init)]
-                None => vec![0..data.len()],
+            let start = (lo - lo16) as usize;
+            data.drain(..start);
+            data.truncate((hi - lo) as usize);
+            if let Some(h) = hasher.as_mut() {
+                h.update(&data);
             }
+            Ok(data)
         };
 
-        #[cfg(feature = "compression")]
-        macro_rules! decompress {
-            ($decompressor: ty) => {
-                for range in ranges {
-                    io::copy(&mut <$decompressor>::new(&data[range]), buf)?;
-                }
-            };
-        }
-
+        const CHUNK: u64 = 1 << 20;
         match self.compression_slot.and_then(|c| compression[c as usize]) {
-            None => buf.write_all(&data)?,
+            None => {
+                let mut pos = 0;
+                while pos < self.compressed {
+                    let end = (pos + CHUNK).min(self.compressed);
+                    buf.write_all(&span(reader, pos, end)?)?;
+                    pos = end;
+                }
+            }
             #[cfg(not(feature = "compression"))]
             _ => return Err(super::Error::Compression),
             #[cfg(feature = "compression")]
             Some(comp) => {
-                let chunk_size = if ranges.len() == 1 {
-                    self.uncompressed as usize
-                } else {
-                    self.compression_block_size as usize
+                let rel = |index: u64| -> u64 {
+                    match version.version_major() >= VersionMajor::RelativeChunkOffsets {
+                        true => index - (data_offset - self.offset),
+                        false => index - data_offset,
+                    }
                 };
-
-                match comp {
-                    Compression::Zlib => decompress!(flate2::read::ZlibDecoder<&[u8]>),
-                    Compression::Gzip => decompress!(flate2::read::GzDecoder<&[u8]>),
-                    Compression::Zstd => {
-                        for range in ranges {
-                            io::copy(&mut zstd::stream::read::Decoder::new(&data[range])?, buf)?;
+                let ranges: Vec<(u64, u64)> = match &self.blocks {
+                    Some(blocks) => blocks.iter().map(|b| (rel(b.start), rel(b.end))).collect(),
+                    None => vec![(0, self.compressed)],
+                };
+                let chunk_size = if ranges.len() == 1 {
+                    self.uncompressed
+                } else {
+                    self.compression_block_size as u64
+                };
+                for (i, (lo, hi)) in ranges.iter().enumerate() {
+                    let block = span(reader, *lo, *hi)?;
+                    let out_len = chunk_size.min(self.uncompressed - (i as u64 * chunk_size).min(self.uncompressed));
+                    match comp {
+                        Compression::Zlib => {
+                            io::copy(&mut flate2::read::ZlibDecoder::new(&block[..]), buf)?;
                         }
-                    }
-                    Compression::LZ4 => {
-                        let mut decompressed = vec![0; self.uncompressed as usize];
-                        for (decomp_chunk, comp_range) in
-                            decompressed.chunks_mut(chunk_size).zip(ranges)
-                        {
-                            lz4_flex::block::decompress_into(&data[comp_range], decomp_chunk)
+                        Compression::Gzip => {
+                            io::copy(&mut flate2::read::GzDecoder::new(&block[..]), buf)?;
+                        }
+                        Compression::Zstd => {
+                            io::copy(&mut zstd::stream::read::Decoder::new(&block[..])?, buf)?;
+                        }
+                        Compression::LZ4 => {
+                            let mut out = vec![0; out_len as usize];
+                            lz4_flex::block::decompress_into(&block, &mut out)
                                 .map_err(|_| Error::DecompressionFailed(Compression::LZ4))?;
+                            buf.write_all(&out)?;
                         }
-                        buf.write_all(&decompressed)?;
-                    }
-                    #[cfg(feature = "oodle_core")]
-                    Compression::Oodle => {
-                        let mut decompressed = vec![0; self.uncompressed as usize];
-                        for (decomp_chunk, comp_range) in
-                            decompressed.chunks_mut(chunk_size).zip(ranges)
-                        {
-                            let out =
-                                oodle_loader::oodle()?.decompress(&data[comp_range], decomp_chunk);
-                            if out == 0 {
+                        #[cfg(feature = "oodle_core")]
+                        Compression::Oodle => {
+                            let mut out = vec![0; out_len as usize];
+                            if oodle_loader::oodle()?.decompress(&block, &mut out) == 0 {
                                 return Err(Error::DecompressionFailed(Compression::Oodle));
                             }
+                            buf.write_all(&out)?;
                         }
-                        buf.write_all(&decompressed)?;
+                        #[cfg(not(feature = "oodle_core"))]
+                        Compression::Oodle => return Err(super::Error::Oodle),
                     }
-                    #[cfg(not(feature = "oodle_core"))]
-                    Compression::Oodle => return Err(super::Error::Oodle),
                 }
             }
         }
+        }
         buf.flush()?;
+        if verify && encrypted && compressed_entry {
+            let mut h = Sha1::new();
+            reader.seek(io::SeekFrom::Start(data_offset))?;
+            let mut left = stored_len;
+            let mut chunk = vec![0u8; (1 << 20).min(stored_len.max(1)) as usize];
+            while left > 0 {
+                let n = left.min(chunk.len() as u64) as usize;
+                reader.read_exact(&mut chunk[..n])?;
+                h.update(&chunk[..n]);
+                left -= n as u64;
+            }
+            hasher = Some(h);
+        }
+        if let (Some(h), Some(expected)) = (hasher, expected) {
+            let actual: [u8; 20] = h.finalize().into();
+            if actual != expected.0 {
+                return Err(super::Error::HashMismatch);
+            }
+        }
         Ok(())
     }
 }
