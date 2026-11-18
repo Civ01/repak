@@ -1259,3 +1259,27 @@ fn compact_drops_dead_space() {
     }
     assert_eq!(checked, 13);
 }
+
+#[test]
+fn align_to_pads_and_entries_stay_readable() {
+    let mut w = repak::PakBuilder::new()
+        .compression([repak::Compression::Zlib])
+        .writer(
+            Cursor::new(vec![]),
+            repak::Version::V11,
+            "../../../G/".into(),
+            Some(1),
+        );
+    w.write_file("a.txt", true, b"aaaa".repeat(1000)).unwrap();
+    let pad = w.align_to(65536).unwrap();
+    assert!(pad > 0);
+    assert_eq!(w.align_to(65536).unwrap(), 0, "already aligned");
+    w.write_file("b.txt", true, b"bbbb".repeat(1000)).unwrap();
+    let bytes = w.write_index().unwrap().into_inner();
+    let mut r = Cursor::new(&bytes);
+    let p = repak::PakBuilder::new().reader(&mut r).unwrap();
+    let b = p.entries().find(|(n, _)| *n == "b.txt").unwrap().1;
+    assert_eq!(b.offset % 65536, 0);
+    assert_eq!(p.get("b.txt", &mut r).unwrap(), b"bbbb".repeat(1000));
+    assert_eq!(p.get("a.txt", &mut r).unwrap(), b"aaaa".repeat(1000));
+}

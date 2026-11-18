@@ -553,6 +553,25 @@ impl<W: Write + Seek> PakWriter<W> {
         self.writer
     }
 
+    /// Pads with zero bytes until the write position is a multiple of
+    /// `alignment` (as UnrealPak pads entries it aligns). Returns the number
+    /// of bytes written.
+    pub fn align_to(&mut self, alignment: u64) -> Result<u64, super::Error> {
+        if alignment <= 1 {
+            return Ok(0);
+        }
+        let pos = self.writer.stream_position()?;
+        let pad = (alignment - pos % alignment) % alignment;
+        let zeros = [0u8; 4096];
+        let mut left = pad;
+        while left > 0 {
+            let n = left.min(zeros.len() as u64) as usize;
+            self.writer.write_all(&zeros[..n])?;
+            left -= n as u64;
+        }
+        Ok(pad)
+    }
+
     /// Copies entry `path` of `from` (read from `src`) into this pak as
     /// `new_path`, stored bytes as they are: no recompression, no
     /// re-encryption (encrypted entries need no key). Used for compacting.
